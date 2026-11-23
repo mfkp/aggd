@@ -80,7 +80,9 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--heatmap`, `--heatmap-dir` | the same |
 | `--modeac` | accepted; like readsb on an aggregator it shows nothing |
 | `--net-uat-in-port` | the same |
-| `--net-vrs-port`, `--net-ro-port`, `--net-ri-port`, ASTERIX, `--write-prom` | not there. Prometheus metrics are at `/metrics` |
+| `--write-prom=FILE` | the same: what `/metrics` serves, written to FILE every `--write-json-every` seconds. aggd's own metric names, not readsb's |
+| `--debug=…` | accepted; aggd logs what it logs |
+| `--net-vrs-port`, `--net-ro-port`, `--net-ri-port`, ASTERIX | not there |
 
 Receivers need no change: same host, same port, same protocol.
 
