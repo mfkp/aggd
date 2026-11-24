@@ -12,6 +12,50 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// Access-Control-Allow-Origin on every answer (--cors-origin).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cors {
+    /// `*`: any page may read the data (the default)
+    Any,
+    /// no header: a proxy in front sets its own, or no browser reads us
+    Off,
+    /// only these origins, each answered with its own name
+    Origins(Vec<String>),
+}
+
+impl Cors {
+    /// `*`, `none`, or origins separated by commas (scheme://host[:port]).
+    pub fn parse(s: &str) -> Result<Cors, String> {
+        match s.trim() {
+            "*" => return Ok(Cors::Any),
+            "none" | "" => return Ok(Cors::Off),
+            _ => {}
+        }
+        let mut origins = Vec::new();
+        for o in s.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+            let host = o.strip_prefix("https://").or_else(|| o.strip_prefix("http://"));
+            match host {
+                Some(h) if !h.is_empty() && !h.contains(['/', ' ', '*']) => origins.push(o.to_ascii_lowercase()),
+                _ => return Err(format!("{o} is not an origin (scheme://host[:port], no path)")),
+            }
+        }
+        Ok(Cors::Origins(origins))
+    }
+
+    /// The header lines for an answer to a request from `origin`.
+    fn headers(&self, origin: Option<&str>) -> String {
+        match self {
+            Cors::Any => "Access-Control-Allow-Origin: *\r\nVary: Accept-Encoding\r\n".into(),
+            Cors::Off => "Vary: Accept-Encoding\r\n".into(),
+            // the answer now depends on who asks, so caches must keep them apart
+            Cors::Origins(list) => match origin.filter(|o| list.iter().any(|l| l == o)) {
+                Some(o) => format!("Access-Control-Allow-Origin: {o}\r\nVary: Accept-Encoding, Origin\r\n"),
+                None => "Vary: Accept-Encoding, Origin\r\n".into(),
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Entry {
     at: Ms,
@@ -291,6 +335,7 @@ async fn conn(ctx: Arc<Ctx>, mut s: TcpStream) {
         let (method, target) = (rl.next().unwrap_or(""), rl.next().unwrap_or("/"));
         let mut enc = Enc::Plain;
         let mut close = false;
+        let mut origin = None;
         for l in lines {
             let Some((k, v)) = l.split_once(':') else { continue };
             let v = v.trim().to_ascii_lowercase();
@@ -304,6 +349,8 @@ async fn conn(ctx: Arc<Ctx>, mut s: TcpStream) {
                 };
             } else if k.eq_ignore_ascii_case("connection") && v.contains("close") {
                 close = true;
+            } else if k.eq_ignore_ascii_case("origin") {
+                origin = Some(v);
             }
         }
         let resp = if method != "GET" && method != "HEAD" {
@@ -325,11 +372,12 @@ async fn conn(ctx: Arc<Ctx>, mut s: TcpStream) {
             _ => "Error",
         };
         let mut h = format!(
-            "HTTP/1.1 {} {}\r\nServer: aggd\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nVary: Accept-Encoding\r\n",
+            "HTTP/1.1 {} {}\r\nServer: aggd\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}",
             resp.status,
             reason,
             resp.ctype,
-            resp.body.len()
+            resp.body.len(),
+            ctx.cfg.cors.headers(origin.as_deref())
         );
         match resp.enc {
             Enc::Gzip => h.push_str("Content-Encoding: gzip\r\n"),
@@ -372,4 +420,36 @@ pub async fn listen(ctx: Arc<Ctx>, addr: String) -> anyhow::Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_origin_settings() {
+        assert_eq!(Cors::parse("*"), Ok(Cors::Any));
+        assert_eq!(Cors::parse("none"), Ok(Cors::Off));
+        assert_eq!(
+            Cors::parse("https://map.example.org, http://localhost:8080"),
+            Ok(Cors::Origins(vec!["https://map.example.org".into(), "http://localhost:8080".into()]))
+        );
+        assert!(Cors::parse("map.example.org").is_err());
+        assert!(Cors::parse("https://map.example.org/").is_err());
+        assert!(Cors::parse("https://*.example.org").is_err());
+    }
+
+    #[test]
+    fn cors_headers_by_setting() {
+        // as before: any page, whoever asks
+        assert_eq!(Cors::Any.headers(None), "Access-Control-Allow-Origin: *\r\nVary: Accept-Encoding\r\n");
+        assert_eq!(Cors::Any.headers(Some("https://a.example")), Cors::Any.headers(None));
+        // behind a proxy that sets its own: never a second value
+        assert!(!Cors::Off.headers(Some("https://a.example")).contains("Access-Control"));
+        // a list: the asking origin when it is on it, nothing otherwise
+        let list = Cors::parse("https://a.example,https://b.example").unwrap();
+        assert_eq!(list.headers(Some("https://b.example")), "Access-Control-Allow-Origin: https://b.example\r\nVary: Accept-Encoding, Origin\r\n");
+        assert_eq!(list.headers(Some("https://evil.example")), "Vary: Accept-Encoding, Origin\r\n");
+        assert_eq!(list.headers(None), "Vary: Accept-Encoding, Origin\r\n");
+    }
 }

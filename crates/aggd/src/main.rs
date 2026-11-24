@@ -156,6 +156,12 @@ struct Cli {
     /// directory makes aggd a complete map server
     #[arg(long)]
     web_root: Option<String>,
+    /// Access-Control-Allow-Origin on HTTP answers: * lets any page read
+    /// the data; none leaves the header out, for a proxy in front that sets
+    /// its own; or origins separated by commas (https://map.example.org),
+    /// each answered with its own name and the rest with no header
+    #[arg(long, default_value = "*")]
+    cors_origin: String,
     /// Seconds an aircraft stays listed after it was last heard
     #[arg(long, default_value_t = 60.0)]
     interactive_ttl: f64,
@@ -257,6 +263,7 @@ pub struct Config {
     pub sbs_reduce: bool,
     pub web_root: Option<String>,
     pub history_dir: Option<String>,
+    pub cors: http::Cors,
 }
 
 /// Counters kept for stats.json: totals since start, sampled every ten
@@ -545,6 +552,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         sbs_reduce: cli.net_sbs_reduce,
         web_root: cli.web_root.clone().map(|d| d.trim_end_matches('/').to_string()),
         history_dir: cli.write_globe_history.clone().map(|d| d.trim_end_matches('/').to_string()),
+        cors: http::Cors::parse(&cli.cors_origin).map_err(|e| anyhow::anyhow!("--cors-origin: {e}"))?,
     };
     let mut trusted = Vec::new();
     for t in &cli.net_trusted {

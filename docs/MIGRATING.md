@@ -98,7 +98,11 @@ aggd ... --http-port 8080 --web-root /usr/local/share/tar1090/html
 With `--web-root`, `/` is the page and the API is at `/re-api/`. A custom
 map that reads `data/aircraft.json`, `data/aircraft.binCraft.zst`,
 `data/globe_N.binCraft.zst`, `data/traces/…` or `re-api/?…` needs no change.
-aggd sends CORS headers for any origin.
+aggd sends `Access-Control-Allow-Origin: *` by default. Behind a proxy that
+sets its own (nginx with `add_header Access-Control-Allow-Origin …`),
+`--cors-origin none` leaves it out, so browsers do not get two values and
+refuse the answer; `--cors-origin https://map.example.org,https://…` answers
+only those pages, each with its own name.
 
 Fields a patched readsb may add are behind flags: `--json-receiver-count`
 adds `rcvrs` and `receiverCount` to each aircraft.
