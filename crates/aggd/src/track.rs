@@ -233,6 +233,10 @@ pub struct Aircraft {
     suspect: Option<Suspect>,
     /// receivers already found at fault, not yet reported
     blame_due: ([u64; 4], u8),
+    /// a decoded position that a place solved elsewhere could not have
+    /// led to, waiting for another of the aircraft's messages to agree:
+    /// (lat, lon, time, frame key)
+    far: Option<(f64, f64, Ms, u64)>,
     /// the message in hand came over a link the operator trusts
     /// (`--net-trusted`); set by the caller before each message
     pub by_trusted: bool,
@@ -367,6 +371,7 @@ impl Aircraft {
             pos_confirmed: 0,
             suspect: None,
             blame_due: ([0; 4], 0),
+            far: None,
             by_trusted: false,
             anchor: 0,
             pos_trusted: false,
@@ -1008,12 +1013,45 @@ fn adopt(a: &mut Aircraft, lat: f64, lon: f64, c: &Cpr, src: Source, now: Ms, rx
     a.pos_rx = rx;
     a.pos_surface = c.surface;
     a.pos_bad = 0;
+    a.far = None;
     a.anchor = if a.by_trusted { (now as u32).max(1) } else { 0 };
     a.pos_trusted = a.by_trusted;
     a.witness(rx, now);
 }
 
+/// How far the aircraft can have gone in `dt` seconds, in metres: its
+/// ground speed with a third to spare (at least 60 kt on the surface,
+/// 200 kt in the air), or 150 kt and 900 kt when no speed is known.
+fn reach_m(a: &Aircraft, surface: bool, now: Ms, dt: f64) -> f64 {
+    let speed_kt = match a.gs.get(now) {
+        Some(g) => (g as f64 * 1.3).max(if surface { 60.0 } else { 200.0 }),
+        None => {
+            if surface {
+                150.0
+            } else {
+                900.0
+            }
+        }
+    };
+    speed_kt * 0.5144 * (dt + 1.0) + 150.0
+}
+
+/// How far a place solved elsewhere (MLAT, a BaseStation feed, ADS-C)
+/// may be from the truth before the aircraft's own word, against it,
+/// needs saying twice. MLAT a few kilometres off is ordinary.
+const SOLVED_SLACK_M: f64 = 20_000.0;
+/// How long a far decode waits for another to agree with it.
+const FAR_HOLD: Ms = 10_000;
+
 fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Option<(f64, f64)>, frame_key: u64) -> Pos {
+    // Both fields zero is a transponder with no fix saying so in a
+    // position message. Decoded, a surface pair of them lands on the
+    // equator at a multiple of 90 degrees, one alone on the corner of a
+    // zone near the last place, and the aircraft's later messages are
+    // read against that (seen beside readsb, which showed neither).
+    if c.lat == 0 && c.lon == 0 {
+        return Pos::None;
+    }
     // The same transmission arrives once per receiver that heard it.
     let key = c.lat as u64 | (c.lon as u64) << 17 | (c.odd as u64) << 34 | (c.surface as u64) << 35 | (now / 16_384) << 36;
     let key_prev = key.wrapping_sub(1 << 36);
@@ -1091,6 +1129,26 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     }
     let Some((lat, lon)) = fix else { return Pos::None };
 
+    // A place solved elsewhere gives way to the aircraft's own word (as
+    // below), but not to one message that puts it where it cannot have
+    // got to. Taken at once, a single bad decode after a BaseStation
+    // position moved an airliner 300 km, and was then the reference its
+    // next messages were read against. A second message that agrees
+    // settles it: then the solved place was the wrong one.
+    if a.pos.src != Source::Invalid && a.pos.src < Source::Tisb && now.saturating_sub(a.pos.t) < 120_000 {
+        let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
+        if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > reach_m(a, c.surface, now, dt) + SOLVED_SLACK_M {
+            let agreed = a.far.map_or(false, |(flat, flon, ft, fkey)| {
+                let since = now.saturating_sub(ft);
+                fkey != key && since <= FAR_HOLD && dist_m(flat, flon, lat, lon) <= reach_m(a, c.surface, now, since as f64 / 1000.0)
+            });
+            if !agreed {
+                a.far = Some((lat, lon, now, key));
+                return Pos::None;
+            }
+        }
+    }
+
     // A position must be reachable from the previous one.
     // (One solved elsewhere, by MLAT or from an ADS-C report, is no
     // measure of that: the aircraft's own word replaces it. Held to a
@@ -1099,18 +1157,7 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     // back, every few seconds; readsb takes the first ADS-B position.)
     if a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 120_000 && a.pos.src >= Source::Tisb {
         let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
-        let speed_kt = match a.gs.get(now) {
-            Some(g) => (g as f64 * 1.3).max(if c.surface { 60.0 } else { 200.0 }),
-            None => {
-                if c.surface {
-                    150.0
-                } else {
-                    900.0
-                }
-            }
-        };
-        let allowed = speed_kt * 0.5144 * (dt + 1.0) + 150.0;
-        if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > allowed {
+        if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > reach_m(a, c.surface, now, dt) {
             if a.by_trusted && !a.pos_trusted && global {
                 // Our own receiver against a place only strangers gave:
                 // ours is believed at once, and they answer for it.
@@ -1693,6 +1740,70 @@ mod tests {
         assert_eq!(a.pos.src, Source::Adsb);
         assert!((a.pos.v.0 - 45.5).abs() < 1e-3);
         assert_eq!(crate::json::type_str(&a, T0 + 1400), "adsb_icao");
+    }
+
+    #[test]
+    fn one_message_cannot_carry_an_aircraft_off_from_a_solved_place() {
+        // Seen beside readsb: an airliner placed by a BaseStation feed at
+        // 37.03 -112.36, then put 300 km away by a single ADS-B decode,
+        // which readsb did not show.
+        let place = (37.03, -112.36);
+        let far = (39.125, -110.145);
+        let sbs = |p| External { source: Source::Sbs, pos: Some(p), ..Default::default() };
+        let mut a = Aircraft::new(1, T0);
+        feed(&mut a, &enc::velocity(1, 424.0, 252.0, 0, None), T0);
+        assert_eq!(apply_external(&mut a, &sbs(place), T0, T0), Pos::New);
+        let m = modes::decode(&enc::airborne_position(1, far.0, far.1, 30000, false, 11), |_| true).unwrap();
+        assert_eq!(apply(&mut a, &m, 100, T0 + 1000, 2, None, 0).pos, Pos::None);
+        assert_eq!(a.pos.src, Source::Sbs);
+        assert!((a.pos.v.0 - place.0).abs() < 1e-6);
+        // its own messages from where the feed had it are taken at once
+        let r = feed(&mut a, &enc::airborne_position(1, place.0, place.1 - 0.005, 30000, true, 11), T0 + 1500);
+        assert_eq!(r.pos, Pos::New);
+        assert_eq!(a.pos.src, Source::Adsb);
+        assert!((a.pos.v.0 - place.0).abs() < 1e-3);
+
+        // Two of its own messages that agree move it however far: then
+        // the solved place was the wrong one.
+        let mut b = Aircraft::new(2, T0);
+        assert_eq!(apply_external(&mut b, &sbs(place), T0, T0), Pos::New);
+        assert_eq!(feed(&mut b, &enc::airborne_position(2, far.0, far.1, 30000, false, 11), T0 + 1000).pos, Pos::None);
+        let r = feed(&mut b, &enc::airborne_position(2, far.0, far.1 - 0.002, 30000, true, 11), T0 + 1500);
+        assert_eq!(r.pos, Pos::New);
+        assert!((b.pos.v.0 - far.0).abs() < 1e-3 && (b.pos.v.1 - far.1).abs() < 1e-2);
+    }
+
+    #[test]
+    fn a_position_message_of_zeros_places_nothing() {
+        // A transponder with no fix may still send position messages,
+        // both fields zero. As a surface pair they decode to the equator
+        // on a quarter meridian: beside readsb, (0, -90) for an aircraft
+        // at a New Jersey airport and (0, -180) for one at Anchorage, and
+        // one alone, read against the place before, to a zone corner.
+        let newark = (40.692, -74.165);
+        let mut a = Aircraft::new(1, T0);
+        let sbs = External { source: Source::Sbs, pos: Some(newark), ..Default::default() };
+        assert_eq!(apply_external(&mut a, &sbs, T0, T0), Pos::New);
+        for i in 0..4u64 {
+            let r = feed(&mut a, &enc::surface_position(1, 0.0, 0.0, 0.0, 0.0, i % 2 == 1), T0 + 500 * (i + 1));
+            assert_eq!(r.pos, Pos::None, "message {i}");
+        }
+        assert_eq!(a.pos.v, newark);
+        // nor with only the receiver's location to go by
+        let mut b = Aircraft::new(2, T0);
+        for i in 0..2u64 {
+            let m = modes::decode(&enc::surface_position(2, 0.0, 0.0, 0.0, 0.0, i == 1), |_| true).unwrap();
+            assert_eq!(apply(&mut b, &m, 100, T0 + 500 * i, 1, Some((61.2, -150.0)), 0).pos, Pos::None);
+        }
+        // airborne: a pair of zeros would be (0, 0)
+        let mut c = Aircraft::new(3, T0);
+        feed(&mut c, &enc::airborne_position(3, 0.0, 0.0, 1000, false, 11), T0);
+        assert_eq!(feed(&mut c, &enc::airborne_position(3, 0.0, 0.0, 1000, true, 11), T0 + 500).pos, Pos::None);
+        assert_eq!(c.pos.src, Source::Invalid);
+        // a real place that merely has a zero field still decodes
+        let mut d = Aircraft::new(4, T0);
+        feed(&mut d, &enc::airborne_position(4, 0.0, 9.25, 1000, false, 11), T0);
+        assert_eq!(feed(&mut d, &enc::airborne_position(4, 0.0, 9.25, 1000, true, 11), T0 + 500).pos, Pos::New);
     }
 
     #[test]
