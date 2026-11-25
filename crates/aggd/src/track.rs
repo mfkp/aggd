@@ -1202,8 +1202,12 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
             }
             a.pos_bad += 1;
             if a.pos_bad > 4 {
-                // the old position was the wrong one: start over
+                // the old position was the wrong one: start over. It is
+                // still a better rough place for surface messages than
+                // where the aircraft last went quiet, which may be the
+                // far end of the flight it has just made.
                 a.pos_bad = 0;
+                a.last_place = Some(a.pos.v);
                 a.pos.src = Source::Invalid;
                 a.pos_confirmed = 0;
                 a.cpr = [RxCpr::default(); CPR_ROWS];
@@ -1872,6 +1876,27 @@ mod tests {
         // an airborne position does
         feed(&mut a, &enc::airborne_position(1, 45.5, 9.25, 500, false, 11), T0 + 1200);
         assert!(!a.on_ground(T0 + 1200));
+    }
+
+    #[test]
+    fn a_landing_aircraft_is_read_against_where_it_just_was() {
+        // Seen beside readsb: airliners back from long flights landed, were
+        // refused on the ground and started over, and were then read
+        // against where they had stood hours before at the far end, one a
+        // quarter of the globe away in latitude, one in longitude. readsb
+        // kept them at the airport.
+        let mut a = Aircraft::new(1, T0);
+        a.last_place = Some((7.18, 79.89));
+        feed(&mut a, &enc::airborne_position(1, 55.95, 37.40, 1000, false, 11), T0);
+        feed(&mut a, &enc::airborne_position(1, 55.95, 37.40, 1000, true, 11), T0 + 500);
+        assert!(a.pos_valid(T0 + 500));
+        // on the ground, out of reach of that last fix until it starts over
+        let mut t = T0 + 1500;
+        for i in 0..12 {
+            feed(&mut a, &enc::surface_position(1, 56.10, 37.40, 10.0, 0.0, i % 2 == 1), t);
+            t += 500;
+        }
+        assert!(a.pos_valid(t) && (a.pos.v.0 - 56.10).abs() < 1e-3 && (a.pos.v.1 - 37.40).abs() < 1e-3, "placed at {:?}", a.pos.v);
     }
 
     #[test]
