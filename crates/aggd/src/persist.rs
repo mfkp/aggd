@@ -304,14 +304,52 @@ pub fn load_state(ctx: &Ctx, dir: &str, now: Ms) -> std::io::Result<usize> {
         if end > raw.len() {
             return Err(bad());
         }
-        let points: Vec<Packed> = raw[i..end].chunks_exact(POINT).map(get_point).filter(|p| now.saturating_sub(p.t) <= ctx.cfg.trace_keep_ms).map(|p| Packed::pack(&p)).collect();
+        let saved = &raw[i..end];
         i = end;
-        let Some(last) = points.last() else { continue };
-        let seen = last.t();
-        let trace = trace::Trace::restored(&points, written.saturating_sub(count - points.len()).min(points.len()));
-        let gone = crate::track::Gone { seen, pos: Default::default(), nic: 0, rc: 0, last_place: None, heat_tag: 0, trace };
+        let Some(gone) = restore_one(saved, written, now, ctx.cfg.trace_keep_ms) else { continue };
         ctx.store.shard(addr).lock().gone.insert(addr, gone);
         n += 1;
     }
     Ok(n)
+}
+
+/// One aircraft's saved points, back as an aircraft forgotten while
+/// running: its trace, and where it last was for its surface messages
+/// to be read against. Without that place, an aircraft parked through
+/// a restart and heard only by receivers with no location of their own
+/// went unplaced until it moved (seen beside readsb, which went on
+/// showing it). None when no point is recent enough to keep.
+fn restore_one(saved: &[u8], written: usize, now: Ms, keep_ms: Ms) -> Option<crate::track::Gone> {
+    let count = saved.len() / POINT;
+    let points: Vec<Packed> = saved.chunks_exact(POINT).map(get_point).filter(|p| now.saturating_sub(p.t) <= keep_ms).map(|p| Packed::pack(&p)).collect();
+    let seen = points.last()?.t();
+    // points are saved oldest first, so the last saved is the last kept
+    let p = get_point(&saved[saved.len() - POINT..]);
+    let last_place = Some((p.lat as f64 / 1e6, p.lon as f64 / 1e6));
+    let trace = trace::Trace::restored(&points, written.saturating_sub(count - points.len()).min(points.len()));
+    Some(crate::track::Gone { seen, pos: Default::default(), nic: 0, rc: 0, last_place, heat_tag: 0, trace })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(t: Ms, lat: i32, lon: i32) -> Point {
+        Point { t, lat, lon, alt: trace::GROUND, alt_geom: trace::NONE, gs: 0, track: 0, rate: 0, geom_rate: 0, ias: 0, flags: 0, addr_type: 0 }
+    }
+
+    #[test]
+    fn a_restored_aircraft_keeps_where_it_last_was() {
+        let now: Ms = 1_795_000_000_000;
+        let mut saved = Vec::new();
+        put_point(&mut saved, &point(now - 7_200_000, 40_640_000, -73_780_000));
+        put_point(&mut saved, &point(now - 100_000, 40_689_500, -74_174_400));
+        let g = restore_one(&saved, 2, now, 86_400_000).unwrap();
+        assert_eq!(g.seen / 100, (now - 100_000) / 100);
+        let (lat, lon) = g.last_place.unwrap();
+        assert!((lat - 40.6895).abs() < 1e-6 && (lon + 74.1744).abs() < 1e-6);
+        assert!(g.pos.src == modes::Source::Invalid && g.trace.len() == 2);
+        // a trace older than the kept window brings nothing back
+        assert!(restore_one(&saved, 2, now + 86_400_000, 86_400_000).is_none());
+    }
 }
