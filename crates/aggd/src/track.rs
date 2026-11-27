@@ -249,9 +249,6 @@ pub struct Aircraft {
     /// the message in hand came over a link the operator trusts
     /// (`--net-trusted`); set by the caller before each message
     pub by_trusted: bool,
-    /// the receiver location given with the message in hand is the
-    /// aggregator's own, not the receiver's; set by the caller
-    pub ref_is_site: bool,
     /// when a trusted link last supplied or confirmed the track's
     /// position (0: never)
     anchor: u32,
@@ -396,7 +393,6 @@ impl Aircraft {
             blame_due: ([0; 4], 0),
             far: None,
             by_trusted: false,
-            ref_is_site: false,
             anchor: 0,
             pos_trusted: false,
             pos_wit: [(0, 0); 6],
@@ -532,11 +528,15 @@ impl Aircraft {
     /// is found (as readsb goes from one straight to the other), and is
     /// still the rough place surface messages are read against: better
     /// than where the aircraft last went quiet, which may be the far end
-    /// of the flight it has just made.
+    /// of the flight it has just made. Where it last stood is kept
+    /// against a fix that never became a track, though: that may be
+    /// another aircraft under the same address.
     fn start_over(&mut self) {
         self.pos_bad = 0;
         self.outvoted = 0;
-        self.last_place = Some(self.pos.v);
+        if self.established() || self.last_place.is_none() {
+            self.last_place = Some(self.pos.v);
+        }
         self.pos_confirmed = 0;
         self.pos_globals = 0;
         self.restarted = true;
@@ -1244,8 +1244,14 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
                 // has no location of its own.
                 let known = if a.pos.src != Source::Invalid { Some(a.pos.v) } else { a.last_place };
                 let r = if have_pos { Some(a.pos.v) } else { rx_ref.or(known) };
-                let by_site = a.ref_is_site && !have_pos && known.is_none() && rx_ref.is_some();
-                r.and_then(|(rl, ro)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro).filter(|&(l, o)| !by_site || dist_m(rl, ro, l, o) <= SITE_REACH_M))
+                // A place read against a rough one is believed only near it:
+                // what one receiver there could hear. A rough place that is
+                // not the aircraft's (one stray fix, another aircraft under
+                // the same address) gives one a quarter of the globe off,
+                // and the next is tried: the receiver's, then where the
+                // aircraft last stood.
+                let near = |(rl, ro): (f64, f64)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro).filter(|&(l, o)| dist_m(rl, ro, l, o) <= SITE_REACH_M);
+                r.into_iter().chain(rx_ref).chain(known).chain(a.last_place).find_map(near)
             } else {
                 global = true;
                 cpr::global_airborne(e.lat, e.lon, d.lat, d.lon, c.odd)
@@ -2073,6 +2079,39 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_fix_does_not_carry_a_parked_aircraft_away() {
+        // Seen beside readsb, on one trusted link carrying many receivers:
+        // an aircraft parked overnight at a European airport was placed,
+        // a minute and a half before it started to move, by one airborne
+        // pair from 7,000 km away (low and slow over the American Midwest,
+        // no doubt another aircraft under the same address). Its surface
+        // messages were then read against that fix and showed it a quarter
+        // of the globe west, on the ground, for seven minutes, until it
+        // took off. readsb kept it at the airport throughout.
+        let (airport, stray) = ((45.731, 4.938), (39.067, -94.897));
+        let say = |a: &mut Aircraft, f: &[u8], now: Ms, rx: u64, key: u64| {
+            let m = modes::decode(f, |_| true).unwrap();
+            a.by_trusted = true;
+            apply(a, &m, 100, now, rx, None, key)
+        };
+        let mut a = Aircraft::new(1, T0);
+        // where it stood when it went quiet, hours before
+        a.last_place = Some(airport);
+        say(&mut a, &enc::airborne_position(1, stray.0, stray.1, 425, false, 11), T0, 2, 1);
+        say(&mut a, &enc::airborne_position(1, stray.0, stray.1, 425, true, 11), T0 + 500, 2, 2);
+        assert!(a.pos_valid(T0 + 500) && dist_m(a.pos.v.0, a.pos.v.1, stray.0, stray.1) < 1_000.0, "the stray fix is taken: {:?}", a.pos.v);
+        let mut t = T0 + 95_000;
+        for i in 0..420u64 {
+            say(&mut a, &enc::surface_position(1, airport.0, airport.1, 0.0, 0.0, i % 2 == 1), t, 3, 10 + i);
+            let at_airport = dist_m(a.pos.v.0, a.pos.v.1, airport.0, airport.1) < 500_000.0;
+            let at_stray = dist_m(a.pos.v.0, a.pos.v.1, stray.0, stray.1) < 1_000.0;
+            assert!(!a.pos_valid(t) || at_airport || at_stray, "message {i}: placed at {:?}", a.pos.v);
+            t += 1000;
+        }
+        assert!(a.pos_valid(t - 1000) && dist_m(a.pos.v.0, a.pos.v.1, airport.0, airport.1) < 1_000.0, "at the end: {:?}", a.pos.v);
+    }
+
+    #[test]
     fn a_parked_aircraft_is_placed_by_where_it_last_was() {
         // no receiver location at all: only the aircraft's own history
         let mut a = Aircraft::new(1, T0);
@@ -2156,7 +2195,6 @@ mod tests {
         let say = |a: &mut Aircraft, p: (f64, f64), site: (f64, f64)| {
             for i in 0..2u64 {
                 let m = modes::decode(&enc::surface_position(a.addr, p.0, p.1, 10.0, 90.0, i == 1), |_| true).unwrap();
-                a.ref_is_site = true;
                 apply(a, &m, 100, T0 + 500 * i, 1, Some(site), i);
             }
         };

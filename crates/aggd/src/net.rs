@@ -529,7 +529,6 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
     // newly connected): the aggregator's --lat/--lon, as readsb reads a
     // surface position against its own, but only for a place a receiver
     // near there could hear.
-    a.ref_is_site = rx_ref.is_none();
     let rx_ref = rx_ref.or(match m.cpr {
         Some(c) if c.surface && !a.pos_valid(now) => ctx.cfg.site,
         _ => None,
