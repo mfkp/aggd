@@ -251,13 +251,9 @@ fn sbs_line(out: &mut Vec<u8>, a: &mut Aircraft, m: &Msg, pos: Pos, now: Ms) {
         11 => 8,
         _ => return,
     };
-    if ty == 1 {
-        // identification repeats every few seconds; say it when it changes
-        match m.callsign {
-            Some(c) if c != a.sbs_callsign => a.sbs_callsign = c,
-            _ => return,
-        }
-    }
+    // (Identification goes out each time it is heard, as readsb sends it:
+    // said only when it changed, a consumer that connected after an
+    // aircraft's first never learned its callsign.)
     let t = sbs_time(now);
     let tilde = if a.addr & modes::NON_ICAO != 0 { "~" } else { "" };
     let _ = write!(out, "MSG,{},1,1,{}{:06X},1,{},{},", ty, tilde, a.addr & 0xFF_FFFF, t, t);
@@ -322,10 +318,29 @@ struct Out {
     sbs: Vec<u8>,
     sbs_jaero: Vec<u8>,
     json: Vec<u8>,
+    /// the receiver last named in `full` and in `reduced` since they
+    /// were sent (--net-receiver-id)
+    full_rid: Option<u64>,
+    reduced_rid: Option<u64>,
+}
+
+/// Name the receiver the frames that follow came from, where the buffer
+/// does not already say so. readsb run with --net-receiver-id puts one
+/// such marker (0x1a 0xe3 and eight bytes) before each batch of frames it
+/// passes on, on its full and its reduced Beast output alike
+/// (tools/rid_probe.py); here it is one at the head of each batch and
+/// wherever the receiver changes within it.
+fn name_receiver(buf: &mut Vec<u8>, last: &mut Option<u64>, rid: u64) {
+    if *last != Some(rid) {
+        buf.extend_from_slice(&[0x1a, 0xE3]);
+        push_escaped(buf, &rid.to_be_bytes());
+        *last = Some(rid);
+    }
 }
 
 impl Out {
     fn flush(&mut self, hub: &Hub) {
+        (self.full_rid, self.reduced_rid) = (None, None);
         let send = |tx: &broadcast::Sender<Chunk>, v: &mut Vec<u8>| {
             if !v.is_empty() {
                 let _ = tx.send(Arc::new(std::mem::take(v)));
@@ -450,7 +465,20 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
                 }
             }
             if ctx.hub.full.receiver_count() > 0 {
+                if ctx.cfg.forward_receiver_id {
+                    name_receiver(&mut out.full, &mut out.full_rid, rid);
+                }
                 beast_encode(&mut out.full, f);
+            }
+            // The plain BaseStation stream has a line for every copy
+            // heard, as readsb's has (31,500 lines a second where the
+            // reduced stream had 4,600, forty receivers on 1,400
+            // aircraft); the reduced one says each thing once. Only a
+            // consumer of the plain stream costs the decoding.
+            if !ctx.cfg.sbs_reduce && ctx.hub.sbs.receiver_count() > 0 {
+                if let Some(m) = modes::decode_with(frame, |x| x == addr, &hints) {
+                    sbs_line(&mut out.sbs, a, &m, if position { Pos::Duplicate } else { Pos::None }, now);
+                }
             }
             return;
         }
@@ -497,6 +525,14 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         Some(c) if c.surface && !a.pos_valid(now) => ctx.reg.reference(rid),
         _ => None,
     };
+    // A receiver with no place of its own (a link that names none, one
+    // newly connected): the aggregator's --lat/--lon, as readsb reads a
+    // surface position against its own, but only for a place a receiver
+    // near there could hear.
+    let rx_ref = rx_ref.or(match m.cpr {
+        Some(c) if c.surface && !a.pos_valid(now) => ctx.cfg.site,
+        _ => None,
+    });
     if !a.db_checked {
         a.db_checked = true;
         a.db = ctx.db.as_ref().and_then(|d| d.describe(m.addr));
@@ -529,6 +565,7 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
             if m.source == Source::Adsb && !a.pos_surface {
                 note_position(ext, rid, r.lat, r.lon, trusted);
             }
+            crate::trace::again(a, now, ctx.cfg.trace_interval_ms);
         }
         Pos::None => {
             if ctx.cfg.json_port_noposition && ctx.hub.json.receiver_count() > 0 && !a.pos_valid(now) {
@@ -537,6 +574,9 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         }
     }
     if ctx.hub.full.receiver_count() > 0 {
+        if ctx.cfg.forward_receiver_id {
+            name_receiver(&mut out.full, &mut out.full_rid, rid);
+        }
         beast_encode(&mut out.full, f);
     }
     let want_r = ctx.hub.reduced.receiver_count() > 0;
@@ -546,6 +586,9 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         if now.saturating_sub(a.reduce_last[kind]) >= ctx.cfg.reduce_interval_ms * mult {
             a.reduce_last[kind] = now;
             if want_r {
+                if ctx.cfg.forward_receiver_id {
+                    name_receiver(&mut out.reduced, &mut out.reduced_rid, rid);
+                }
                 beast_encode(&mut out.reduced, f);
             }
             if want_rp {
@@ -556,7 +599,10 @@ fn handle_frame(ctx: &Ctx, link: &mut Link<'_>, rid: u64, f: &Frame<'_>, now: Ms
         }
     }
     if ctx.hub.sbs.receiver_count() > 0 {
-        let pass = !ctx.cfg.sbs_reduce || {
+        // (an altitude reply from an aircraft whose own ADS-B altitude is
+        // current says nothing new: readsb's reduced stream had none)
+        let redundant = matches!(m.df, 4 | 20) && a.adsb_pos != 0 && now.saturating_sub(a.adsb_pos) < track::STALE;
+        let pass = !ctx.cfg.sbs_reduce || !redundant && {
             let (kind, mult) = reduce_kind(&m);
             let due = now.saturating_sub(a.sbs_last[kind]) >= ctx.cfg.reduce_interval_ms * mult;
             if due {
@@ -646,6 +692,9 @@ pub async fn beast_ingest(ctx: Arc<Ctx>, mut s: TcpStream, peer: std::net::Socke
                 }
             }
             // only our own links may speak for other receivers
+            // (the id stands for every frame up to the next one named:
+            // readsb names the receiver once before each batch it
+            // passes on, not before each frame)
             Event::ReceiverId(r) => pending_rid = trusted.then_some(r),
             Event::Ping(v) => {
                 // the feeder returns our clock value advanced by the time
@@ -656,7 +705,7 @@ pub async fn beast_ingest(ctx: Arc<Ctx>, mut s: TcpStream, peer: std::net::Socke
                 }
             }
             Event::Frame(f) => {
-                let r = pending_rid.take().unwrap_or(rid);
+                let r = pending_rid.unwrap_or(rid);
                 if !trusted && !link.meter.take() {
                     ctx.guard.counters.rate_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -822,6 +871,11 @@ pub async fn sbs_ingest(ctx: Arc<Ctx>, s: TcpStream, proto: Proto, local: bool) 
                     let mut bytes = Vec::with_capacity(72);
                     for f in &frames {
                         beast_encode(&mut bytes, &Frame { kind: 0x33, ts: &MLAT_MAGIC, signal: 0, bytes: f });
+                    }
+                    if ctx.cfg.forward_receiver_id {
+                        // from no receiver: the solver's
+                        name_receiver(&mut out.full, &mut out.full_rid, 0);
+                        name_receiver(&mut out.reduced, &mut out.reduced_rid, 0);
                     }
                     out.full.extend_from_slice(&bytes);
                     out.reduced.extend_from_slice(&bytes);

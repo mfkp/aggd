@@ -34,8 +34,10 @@ pub const FLAG_RATE_GEOM: u8 = 4;
 pub const FLAG_ALT_GEOM: u8 = 8;
 
 /// What else was known about the aircraft at a point: kept for one
-/// point a minute, so a history view can say who it was and what it
-/// was doing. Absent values are the type's maximum (or -1).
+/// point in four, as readsb has it (of 264,861 points in its trace
+/// files 25.3 % carried the object, 64,270 times in 65,001 three
+/// points after the last), so a history view can say who it was and
+/// what it was doing. Absent values are the type's maximum (or -1).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Detail {
@@ -189,6 +191,13 @@ pub struct Trace {
     /// what is in its trace files on disk (--write-traces); absent until
     /// they are first written
     pub files: Option<Box<Files>>,
+    /// The day file this process last wrote for the trace: its day
+    /// (days since 1970; 0: none yet), the time of the first point the
+    /// trace had for it, and whether the file held points the trace
+    /// did not. See `persist::write_history`.
+    pub file_day: u32,
+    pub file_more: bool,
+    pub file_first: Ms,
 }
 
 /// The newest point in each of an aircraft's trace files on disk, and
@@ -225,14 +234,24 @@ struct Cold {
     last: Ms,
 }
 
-const PACKED: usize = std::mem::size_of::<Packed>();
-const DETAIL: usize = std::mem::size_of::<Detail>();
+pub const PACKED: usize = std::mem::size_of::<Packed>();
+pub const DETAIL: usize = std::mem::size_of::<Detail>();
 // neither struct may have hidden padding: their bytes are read as they are
 const _: () = assert!(PACKED == 24 && DETAIL == 72 && std::mem::align_of::<Detail>() == 8);
 
 /// Open points at which the older ones are packed away, and how many stay.
 const OPEN_MAX: usize = 128;
 const OPEN_KEEP: usize = 32;
+
+/// How hard zstd works on a chunk. A chunk is packed once and held for a
+/// day, so the time is well spent: on a day of real traces (2.5 million
+/// points in chunks of 96 at most) level 3 took 13 µs a chunk for 11.21
+/// bytes a point, 7: 28 µs for 10.94, 13: 88 µs for 10.68, 19: 460 µs for
+/// 10.59. At a thousand points a second that is a thousandth of a core.
+const LEVEL: i32 = 13;
+/// Where many chunks are packed at once and time counts: saving the open
+/// points when stopping, reading the state file of an earlier version.
+const LEVEL_FAST: i32 = 3;
 
 /// The bytes of `v`. Sound for `Packed` and `Detail` only: plain numbers,
 /// `repr(C)`, no padding.
@@ -320,12 +339,12 @@ fn rows(cols: &[u8], stride: usize, diff: bool) -> Vec<u8> {
 }
 
 impl Cold {
-    fn pack(points: &[Packed], details: &[Detail]) -> Option<Cold> {
+    fn pack(points: &[Packed], details: &[Detail], level: i32) -> Option<Cold> {
         let last = points.last()?.t();
         let mut raw = Vec::with_capacity(points.len() * PACKED + details.len() * DETAIL);
         columns(bytes_of(&delta(points)), PACKED, false, &mut raw);
         columns(bytes_of(details), DETAIL, true, &mut raw);
-        let z = zstd::bulk::compress(&raw, 3).ok()?;
+        let z = zstd::bulk::compress(&raw, level).ok()?;
         Some(Cold { z: z.into_boxed_slice(), points: points.len() as u32, details: details.len() as u32, first: points[0].t(), last })
     }
 
@@ -344,12 +363,9 @@ impl Cold {
 impl Trace {
     /// A trace of `points`, all packed away.
     pub fn restored(points: &[Packed], written: usize) -> Trace {
-        let mut t = Trace { written, ..Default::default() };
-        for c in points.chunks(OPEN_MAX - OPEN_KEEP) {
-            t.points.extend_from_slice(c);
-            t.compact(0);
-        }
-        t
+        let mut cold: Vec<Cold> = points.chunks(OPEN_MAX - OPEN_KEEP).filter_map(|c| Cold::pack(c, &[], LEVEL_FAST)).collect();
+        cold.shrink_to_fit();
+        Trace { written, cold, tail: points.last().map(|p| Box::new((*p, None))), ..Default::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -421,6 +437,21 @@ impl Trace {
         (Cow::Owned(p), Cow::Owned(d))
     }
 
+    /// Put `more` among the open points, each at its time. A point the
+    /// trace already has at that time stays as it is; one from before
+    /// the open points begin is left out.
+    fn merge(&mut self, more: &[Packed]) {
+        let floor = self.cold.last().map_or(0, |c| c.last);
+        let had = self.points.len();
+        self.points.extend(more.iter().filter(|p| p.t() > floor));
+        if self.points.len() > had {
+            // (stable: of two at one time the trace's own comes first)
+            self.points.sort_by_key(|p| p.t);
+            self.points.dedup_by_key(|p| p.t);
+            self.tidy();
+        }
+    }
+
     /// Pack away all but the newest `keep` points, as one more chunk.
     pub fn compact(&mut self, keep: usize) {
         if self.points.len() <= keep {
@@ -432,7 +463,7 @@ impl Trace {
             Some(first_open) => self.details.partition_point(|x| x.t < first_open.t()),
             None => self.details.len(),
         };
-        let Some(cold) = Cold::pack(&self.points[..n], &self.details[..nd]) else { return };
+        let Some(cold) = Cold::pack(&self.points[..n], &self.details[..nd], LEVEL) else { return };
         let last_detail = self.details[..nd].last().copied().or_else(|| self.tail.as_ref().and_then(|t| t.1));
         let tail = (self.points[n - 1], last_detail);
         match &mut self.tail {
@@ -481,53 +512,403 @@ impl Trace {
     }
 }
 
+/// A trace in the state file is its chunks as they are held in memory,
+/// so saving compresses nothing again and restoring unpacks nothing:
+///
+/// ```text
+/// u32 newest points not yet in a history file
+/// u32 chunks    u8 1 if the open points follow them as one more chunk
+/// per chunk: u32 points, u32 details, u64 first, u64 last (ms), u32 bytes, the bytes
+/// u8 what follows: 1 the last point (24 bytes), 2 the last detail too (72 bytes)
+/// ```
+///
+/// all little-endian. A chunk's bytes are `Cold::pack`'s: whoever changes
+/// that, `Packed` or `Detail` gives the state file a new magic.
+pub struct Saved {
+    pub trace: Trace,
+    /// its last chunk was the points open when it was saved
+    pub open: bool,
+    /// newest points not yet in a history file
+    pub behind: usize,
+    /// time of the last point in a chunk packed for good (0: none), the
+    /// open points apart
+    pub until: Ms,
+}
+
+impl Trace {
+    /// Time of the last point packed away for good; 0 if none is.
+    pub fn packed_until(&self) -> Ms {
+        self.cold.last().map_or(0, |c| c.last)
+    }
+
+    /// The newest points not yet in a history file. (Counted from the
+    /// end, the number holds when old points are dropped from the front.)
+    pub fn behind(&self) -> usize {
+        self.len().saturating_sub(self.written)
+    }
+
+    /// Append to `out` what the trace holds after `after`: the chunks
+    /// packed since, and the open points as one more; all of it with 0.
+    /// The trace itself stays as it is.
+    pub fn save(&self, after: Ms, out: &mut Vec<u8>) {
+        let open = Cold::pack(&self.points, &self.details, LEVEL_FAST);
+        let cold = &self.cold[self.cold.partition_point(|c| c.last <= after)..];
+        out.extend_from_slice(&(self.behind() as u32).to_le_bytes());
+        out.extend_from_slice(&(cold.len() as u32).to_le_bytes());
+        out.push(open.is_some() as u8);
+        for c in cold.iter().chain(open.iter()) {
+            out.extend_from_slice(&c.points.to_le_bytes());
+            out.extend_from_slice(&c.details.to_le_bytes());
+            out.extend_from_slice(&c.first.to_le_bytes());
+            out.extend_from_slice(&c.last.to_le_bytes());
+            out.extend_from_slice(&(c.z.len() as u32).to_le_bytes());
+            out.extend_from_slice(&c.z);
+        }
+        match (self.last_point(), self.last_detail()) {
+            (Some(p), Some(d)) => {
+                out.push(2);
+                out.extend_from_slice(bytes_of(&[p]));
+                out.extend_from_slice(bytes_of(&[d]));
+            }
+            (Some(p), None) => {
+                out.push(1);
+                out.extend_from_slice(bytes_of(&[p]));
+            }
+            (None, _) => out.push(0),
+        }
+    }
+
+    /// Read back what `save` wrote, moving `b` past it. `None` if the
+    /// bytes are not a trace; a chunk is checked by its size only, not
+    /// unpacked (the file carries a checksum for the rest).
+    pub fn load(b: &mut &[u8]) -> Option<Saved> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if b.len() < n {
+                return None;
+            }
+            let (head, rest) = b.split_at(n);
+            *b = rest;
+            Some(head)
+        }
+        fn u32_(b: &mut &[u8]) -> Option<u32> {
+            Some(u32::from_le_bytes(take(b, 4)?.try_into().ok()?))
+        }
+        fn u64_(b: &mut &[u8]) -> Option<u64> {
+            Some(u64::from_le_bytes(take(b, 8)?.try_into().ok()?))
+        }
+        let behind = u32_(b)? as usize;
+        let chunks = u32_(b)? as usize;
+        let open = match take(b, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        // (a chunk takes 28 bytes at least: a count that cannot be true
+        // must not reserve memory)
+        let mut cold: Vec<Cold> = Vec::with_capacity((chunks + open as usize).min(b.len() / 28));
+        for _ in 0..chunks + open as usize {
+            let (points, details, first, last) = (u32_(b)?, u32_(b)?, u64_(b)?, u64_(b)?);
+            let n = u32_(b)? as usize;
+            let z = take(b, n)?;
+            let size = points as u64 * PACKED as u64 + details as u64 * DETAIL as u64;
+            let follows = cold.last().map_or(true, |c| c.last < first);
+            if points == 0 || first > last || !follows || zstd::zstd_safe::get_frame_content_size(z).ok().flatten() != Some(size) {
+                return None;
+            }
+            cold.push(Cold { z: z.into(), points, details, first, last });
+        }
+        let tail = match take(b, 1)?[0] {
+            0 => None,
+            1 => Some(Box::new((from_bytes::<Packed>(take(b, PACKED)?)[0], None))),
+            2 => Some(Box::new((from_bytes::<Packed>(take(b, PACKED)?)[0], Some(from_bytes::<Detail>(take(b, DETAIL)?)[0])))),
+            _ => return None,
+        };
+        // what was saved had a last point, and its chunks end with it
+        if cold.last().map_or(0, |c| c.last) > tail.as_ref()?.0.t() {
+            return None;
+        }
+        let until = cold.iter().rev().nth(open as usize).map_or(0, |c| c.last);
+        let mut trace = Trace { points: Vec::new(), details: Vec::new(), written: 0, cold, tail, ..Default::default() };
+        trace.written = trace.len().saturating_sub(behind);
+        Some(Saved { trace, open, behind, until })
+    }
+
+    /// Bring a trace saved whole up to date with what a later
+    /// `save(after)` of it added: `was_open` says its own last chunk was
+    /// the points then open, which the newer chunks contain.
+    pub fn extend(&mut self, was_open: bool, newer: Saved) {
+        if was_open && !newer.trace.cold.is_empty() {
+            self.cold.pop();
+        }
+        // (a file put together from two that do not belong together must
+        // not give a trace that runs backwards)
+        let until = self.packed_until();
+        self.cold.extend(newer.trace.cold.into_iter().filter(|c| c.first > until));
+        self.cold.shrink_to_fit();
+        self.tail = newer.trace.tail;
+        self.written = self.len().saturating_sub(newer.behind);
+    }
+}
+
 fn angle_diff(a: f32, b: f32) -> f32 {
     let d = (a - b).abs() % 360.0;
     d.min(360.0 - d)
 }
 
-/// Record the aircraft's new position if it adds information: a regular
-/// sample every `interval`, sooner when the aircraft turns, changes
-/// altitude or changes between ground and air.
-pub fn add(a: &mut Aircraft, now: Ms, interval: Ms) {
-    let (lat, lon) = a.pos.v;
-    let ground = a.on_ground(now);
-    let alt = if ground { GROUND } else { a.alt_baro.get(now).unwrap_or(NONE) };
-    let track = a.track.get(now);
-    let mut flags = 0;
-    if let Some(last) = a.trace.last_point().map(|p| p.unpack()) {
-        let dt = now.saturating_sub(last.t);
-        if dt < 1000 {
-            return;
-        }
-        let turned = match (track, last.track) {
-            (Some(t), l) if l != u16::MAX => angle_diff(t, l as f32 / 10.0) > 2.0,
-            _ => false,
-        };
-        let moved_alt = alt != last.alt && (alt <= GROUND || last.alt <= GROUND || (alt - last.alt).abs() >= 200);
-        if dt < interval && !turned && !moved_alt {
-            return;
-        }
-        if dt > 300_000 {
-            flags |= FLAG_STALE;
-        }
-        if dt > 1_800_000 || (last.alt == GROUND && alt != GROUND && dt > 600_000) {
-            flags |= FLAG_LEG;
+/// A minute in which every position a second apart is kept: an aircraft's
+/// first, and the one after it leaves or reaches the ground.
+pub const DENSE_MS: Ms = 60_000;
+/// Silence after which the last position heard before it is kept, and
+/// after which the first one heard again is marked stale.
+const GAP_KEEPS_LAST_MS: Ms = 10_000;
+const GAP_STALE_MS: Ms = 15_000;
+
+/// Positions kept whole before a landing: readsb's trace of an aircraft
+/// that has just touched down holds every position of its last 47 s in
+/// the air (94 and 95 of them at two a second, landing at 20 and 60 kt
+/// and off a 900 ft/min approach), where until then it held one every
+/// few seconds.
+const RING: usize = 96;
+/// Barometric altitude below which the newest positions are held back
+/// for that: an aircraft higher up is not about to land. (La Paz, the
+/// highest airport with airline traffic, is at 13,300 ft.)
+const RING_BELOW_FT: i32 = 15_000;
+
+/// The newest positions of an aircraft low enough to land, every one of
+/// them, whether or not the trace kept it: 2.3 KB while it is low.
+pub struct Ring {
+    at: [Packed; RING],
+    /// how many are held, and where the next goes
+    held: u8,
+    next: u8,
+}
+
+impl Ring {
+    fn new() -> Box<Ring> {
+        Box::new(Ring { at: [Packed::default(); RING], held: 0, next: 0 })
+    }
+
+    fn push(&mut self, p: Packed) {
+        self.at[self.next as usize] = p;
+        self.next = (self.next + 1) % RING as u8;
+        self.held = (self.held + 1).min(RING as u8);
+    }
+}
+
+/// Metres between two points a short way apart.
+fn apart_m(a: &Point, b: &Point) -> f64 {
+    let dlat = (a.lat - b.lat) as f64 * 0.111_195;
+    let dlon = (a.lon - b.lon) as f64 * 0.111_195 * (a.lat as f64 * 1e-6).to_radians().cos();
+    dlat.hypot(dlon)
+}
+
+/// Whether the position `p` adds enough to the trace, whose newest point
+/// is `last`, to be kept. This is readsb's rule (3.16, `--json-trace-interval`
+/// 10, 20 and 30) as far as it could be measured from outside, with
+/// scripted flights that each changed one thing at one rate
+/// (`aggbench flight`, 2 positions a second; `tools/trace_probe.sh`
+/// plays them to both), and the whole then compared on live traffic:
+///
+/// - a point every `interval`; in a `dense` minute every second if the
+///   aircraft is somewhere else than at the last point, and every three
+///   where it is not (hovering, parked; at 1 and 2 kt, as its place
+///   came to change, every 1.5 to 3 s);
+/// - a change between ground and air;
+/// - altitude: 75 ft and more up to 7,000 ft, 200 ft up to 12,000 ft,
+///   375 ft above (a climb at 1,000 ft/min: a point every 4.5 s, 11 s
+///   and 19.5 s); and less than that once it has lasted, when the
+///   change times the seconds it took passes 31.25, 62.5 and 200 times
+///   the interval's seconds (at 30 s, 500 ft/min above 12,000 ft is a
+///   point every 27 s at 225 ft; the constants held at 10 and 20 s);
+/// - track: any turn once the degrees, times the seconds it took and
+///   half a second more, reach 18 (0.1, 1 and 4 degrees a second: a
+///   point every 13.5, 4 and 2 s), and a sharp one sooner: 10 degrees
+///   in half a second, 8.75 in one, 7.5 in one and a half (10 and 14
+///   degrees a second: a point every second; 8, 7 and 6: every 1.5 s).
+///   Nineteen rates from 0.07 to 20 degrees a second were flown; the
+///   same at 100 and 500 kt and at every interval;
+/// - ground speed: 10 kt, at any interval;
+/// - vertical rate: more than 200 ft/min different from the last point's
+///   (256 was kept and 192 not, and 224 in live traffic: a transponder
+///   whose rate jitters in level flight gets a point every second or two);
+/// - on the ground, by speed: once the knots, times the seconds and
+///   half a second more, reach 80 (30, 40, 60 and 70 kt: a point every
+///   2.5, 1.5, 1 and 1 s; from 80 kt every position), and when slower
+///   once they reach 18.5 and a tenth of the interval has passed (1 and
+///   2 kt: every 18 and 9 s; 5 to 20 kt: every 3.5 s at 30 s). A turn
+///   on the ground brought no points of its own.
+///
+/// Not matched: readsb also keeps a point 350 ft from the last above
+/// 12,000 ft about one time in four, by a rule not found; and an
+/// aircraft that sends no track gets points from a track readsb works
+/// out from its positions.
+pub fn due(last: &Point, p: &Point, interval: Ms, dense: bool) -> bool {
+    let dt_ms = p.t.saturating_sub(last.t);
+    // (times are kept in tenths of a second)
+    if dt_ms < 100 {
+        return false;
+    }
+    let dt = dt_ms as f64 / 1000.0;
+    let every = interval as f64 / 1000.0;
+    let ground = p.alt == GROUND;
+    if ground != (last.alt == GROUND) {
+        return true;
+    }
+    let still = ground && (p.gs == u16::MAX || p.gs < 10);
+    // (an aircraft standing still: 30 s at 30, and 18 to 20 s at 10)
+    if dt_ms >= if still { interval.max(20_000) } else { interval } {
+        return true;
+    }
+    if dense && (dt_ms >= 3000 || (dt_ms >= 1000 && (p.lat, p.lon) != (last.lat, last.lon))) {
+        return true;
+    }
+    if !ground && p.track != u16::MAX && last.track != u16::MAX {
+        let turn = angle_diff(p.track as f32 / 10.0, last.track as f32 / 10.0) as f64;
+        if turn * (dt + 0.5) >= 18.0 || (dt <= 1.5 && turn >= 11.25 - 2.5 * dt) {
+            return true;
         }
     }
+    if ground {
+        // (without a speed, the distance: a knot for a second is 0.514 m)
+        let run = if p.gs != u16::MAX { p.gs as f64 / 10.0 * (dt + 0.5) } else { apart_m(last, p) / 0.514_444 + 0.5 };
+        return run >= 80.0 || (run >= 18.5 && dt >= (every / 10.0).max(2.0) + 0.25);
+    }
+    // barometric altitude where both points have it, else geometric
+    let (alt, was) = if p.alt != NONE && last.alt != NONE { (p.alt, last.alt) } else { (p.alt_geom, last.alt_geom) };
+    if alt != NONE && was != NONE {
+        let change = (alt - was).abs() as f64;
+        let (at_once, lasting) = if alt <= 7000 {
+            (50.0, 31.25)
+        } else if alt <= 12_000 {
+            (175.0, 62.5)
+        } else {
+            (350.0, 200.0)
+        };
+        if change > at_once || change * dt > lasting * every {
+            return true;
+        }
+    }
+    if p.gs != u16::MAX && last.gs != u16::MAX && (p.gs as i32 - last.gs as i32).abs() >= 100 {
+        return true;
+    }
+    p.rate != i16::MIN && last.rate != i16::MIN && (p.rate as i32 - last.rate as i32).abs() > 200
+}
+
+/// The aircraft as a trace point would record it now.
+fn point_now(a: &Aircraft, now: Ms) -> Point {
+    let (lat, lon) = a.pos.v;
     let (rate, rflag) = match (a.baro_rate.get(now), a.geom_rate.get(now)) {
         (Some(r), _) => (r.clamp(-32000, 32000) as i16, 0),
         (None, Some(r)) => (r.clamp(-32000, 32000) as i16, FLAG_RATE_GEOM),
         _ => (i16::MIN, 0),
     };
+    Point {
+        t: now,
+        lat: (lat * 1e6).round() as i32,
+        lon: (lon * 1e6).round() as i32,
+        alt: if a.on_ground(now) { GROUND } else { a.alt_baro.get(now).unwrap_or(NONE) },
+        alt_geom: a.alt_geom.get(now).unwrap_or(NONE),
+        gs: a.gs.get(now).map_or(u16::MAX, |g| (g * 10.0).round().min(65000.0) as u16),
+        track: a.track.get(now).map_or(u16::MAX, |t| (t * 10.0).round() as u16),
+        rate,
+        geom_rate: a.geom_rate.get(now).map_or(i16::MIN, |r| r.clamp(-32000, 32000) as i16),
+        ias: a.ias.get(now).unwrap_or(u16::MAX),
+        flags: rflag,
+        addr_type: a.addr_type as u8,
+    }
+}
+
+fn push(trace: &mut Trace, p: Packed) {
+    // (the open buffer grows to its limit and no further: doubling would
+    // take it to twice that on every long flight)
+    let open = &mut trace.points;
+    if open.len() == open.capacity() && open.len() >= OPEN_MAX / 2 {
+        open.reserve_exact(OPEN_MAX - open.len());
+    }
+    open.push(p);
+    trace.tidy();
+}
+
+/// Called every few seconds for every aircraft: one that has gone silent
+/// has its trace end where it was last heard, not at the last point the
+/// rule happened to keep. (readsb: 10 s without a position and the last
+/// one is in the trace; 9 s and it is not.)
+pub fn settle(a: &mut Aircraft, now: Ms) {
+    if a.trace_prev.map_or(false, |p| now.saturating_sub(p.t()) >= GAP_KEEPS_LAST_MS) {
+        let prev = a.trace_prev.take().unwrap();
+        if a.trace.last_point().map_or(false, |l| prev.t() > l.t()) {
+            push(&mut a.trace, prev);
+            a.trace_plain = a.trace_plain.saturating_add(1);
+        }
+    }
+}
+
+/// Record the aircraft's new position if it adds to the trace (`due`).
+/// After a silence the position last heard before it is recorded too,
+/// and the first one after it is marked stale: readsb does the first
+/// from 10 s without a position and the second from 15 (gaps of 9 to 14
+/// and of 15 to 200 s in a steady flight).
+pub fn add(a: &mut Aircraft, now: Ms, interval: Ms) {
+    let mut point = point_now(a, now);
+    let track = a.track.get(now);
+    let prev = a.trace_prev.replace(Packed::pack(&point));
+    // (an aircraft that landed 30 s after it was first heard had a point
+    // a second up to its landing, as any new aircraft, and no more)
+    let dense = now < a.trace_dense_until;
+    let low = !dense && point.alt != GROUND && if point.alt != NONE { point.alt } else { point.alt_geom } < RING_BELOW_FT;
+    match &mut a.trace_ring {
+        Some(ring) if low || point.alt == GROUND => ring.push(Packed::pack(&point)),
+        None if low => a.trace_ring.insert(Ring::new()).push(Packed::pack(&point)),
+        _ => a.trace_ring = None,
+    }
+    let mut landed = false;
+    if let Some(mut last) = a.trace.last_point().map(|p| p.unpack()) {
+        let silent = now.saturating_sub(prev.map_or(last.t, |p| p.t()));
+        if silent >= GAP_KEEPS_LAST_MS {
+            if let Some(prev) = prev.filter(|p| p.t() > last.t) {
+                push(&mut a.trace, prev);
+                a.trace_plain = a.trace_plain.saturating_add(1);
+                last = prev.unpack();
+            }
+        }
+        let stale = silent >= GAP_STALE_MS;
+        if !stale && !due(&last, &point, interval, dense) {
+            return;
+        }
+        if stale {
+            point.flags |= FLAG_STALE;
+        }
+        let dt = now.saturating_sub(last.t);
+        if dt > 1_800_000 || (last.alt == GROUND && point.alt != GROUND && dt > 600_000) {
+            point.flags |= FLAG_LEG;
+        }
+        // (taking off at 140 kt and landing at 20 and 60: a point a
+        // second for the 60 s that followed)
+        if (last.alt == GROUND) != (point.alt == GROUND) {
+            a.trace_dense_until = now + DENSE_MS;
+            landed = point.alt == GROUND;
+        }
+    } else {
+        // (as readsb marks the first point of every trace)
+        point.flags |= FLAG_STALE;
+    }
+    if point.alt == GROUND && !landed {
+        // (on the ground nothing is held back)
+        a.trace_ring = None;
+    }
+    let flags = point.flags;
     let first_or_leg = a.trace.is_empty() || flags & FLAG_LEG != 0;
-    let last_detail = a.trace.last_detail();
-    let due = last_detail.map_or(true, |d| now.saturating_sub(d.t) >= 60_000);
-    if first_or_leg || due {
+    let packed = Packed::pack(&point);
+    if first_or_leg || a.trace_plain >= 3 {
+        a.trace_plain = 0;
         let b = |f: &crate::track::F<bool>| f.get(now).map_or(-1, |v| v as i8);
         let n = |f: &crate::track::F<u8>| f.get(now).map_or(-1, |v| v as i8);
         let d = Detail {
-            t: now,
+            // the point's own time, which is kept to a tenth of a
+            // second: the two are matched by it when the trace is
+            // served. (Stamped to the millisecond, 5 details of 8,453
+            // points were ever shown.)
+            t: packed.t(),
             callsign: a.callsign.get(now).unwrap_or([0; 8]),
             squawk: a.squawk.get(now).unwrap_or(u16::MAX),
             category: a.category,
@@ -557,39 +938,27 @@ pub fn add(a: &mut Aircraft, now: Ms, interval: Ms) {
             mag_heading: a.mag_heading.get(now).unwrap_or(f32::NAN),
             true_heading: a.true_heading.get(now).unwrap_or(f32::NAN),
         };
-        // steady flight says the same thing every minute: keep what
-        // changed, and one in ten otherwise
-        let news = last_detail.map_or(true, |l| {
-            now.saturating_sub(l.t) >= 600_000
-                || (l.callsign, l.squawk, l.emergency, l.nav_alt_mcp, l.nav_modes, l.version, l.nac_p, l.sil, l.alert, l.spi)
-                    != (d.callsign, d.squawk, d.emergency, d.nav_alt_mcp, d.nav_modes, d.version, d.nac_p, d.sil, d.alert, d.spi)
-        });
-        if first_or_leg || news {
-            a.trace.details.push(d);
+        a.trace.details.push(d);
+    } else {
+        a.trace_plain += 1;
+    }
+    push(&mut a.trace, packed);
+    if landed {
+        if let Some(ring) = a.trace_ring.take() {
+            a.trace.merge(&ring.at[..ring.held as usize]);
         }
     }
-    let point = Point {
-        t: now,
-        lat: (lat * 1e6).round() as i32,
-        lon: (lon * 1e6).round() as i32,
-        alt,
-        alt_geom: a.alt_geom.get(now).unwrap_or(NONE),
-        gs: a.gs.get(now).map_or(u16::MAX, |g| (g * 10.0).round().min(65000.0) as u16),
-        track: track.map_or(u16::MAX, |t| (t * 10.0).round() as u16),
-        rate,
-        geom_rate: a.geom_rate.get(now).map_or(i16::MIN, |r| r.clamp(-32000, 32000) as i16),
-        ias: a.ias.get(now).unwrap_or(u16::MAX),
-        flags: flags | rflag,
-        addr_type: a.addr_type as u8,
-    };
-    // (the open buffer grows to its limit and no further: doubling would
-    // take it to twice that on every long flight)
-    let open = &mut a.trace.points;
-    if open.len() == open.capacity() && open.len() >= OPEN_MAX / 2 {
-        open.reserve_exact(OPEN_MAX - open.len());
+}
+
+/// The aircraft has said where it is once more in the same words. One
+/// standing still does, again and again, and is to be recorded as it
+/// stands; but so does every transmission that a second receiver
+/// relays, and that is no news. The two are told apart by time: a relay
+/// comes right behind the position it repeats.
+pub fn again(a: &mut Aircraft, now: Ms, interval: Ms) {
+    if a.pos.t == now && a.trace_prev.map_or(false, |p| now.saturating_sub(p.t()) >= 400) {
+        add(a, now, interval);
     }
-    open.push(Packed::pack(&point));
-    a.trace.tidy();
 }
 
 fn addr_type_str(v: u8) -> &'static str {
@@ -924,5 +1293,355 @@ mod cold_tests {
         assert_eq!(file_addr("trace_full_~0abc12.json"), Some((false, 0x0abc12 | modes::NON_ICAO)));
         assert_eq!(file_addr(".trace_full_4ca123.json.tmp"), None);
         assert_eq!(file_addr("trace_full_zz.json"), None);
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+    use crate::track::F;
+    use modes::Source;
+
+    const T: Ms = 1_795_680_000_000;
+
+    /// A flight for `secs` seconds from `start`, two positions a second,
+    /// each thing changing at its own steady rate; returns the seconds
+    /// between the points the rule keeps (but for the first, which is
+    /// measured from wherever the start fell between two altitude steps).
+    #[allow(clippy::too_many_arguments)]
+    fn fly(start: Point, secs: f64, ft_min: f64, deg_s: f64, kt_s: f64, interval: Ms, period_ms: u64) -> Vec<f64> {
+        let mut last = start;
+        let mut gaps = Vec::new();
+        let mut ms = period_ms;
+        while ms as f64 <= secs * 1000.0 {
+            let s = ms as f64 / 1000.0;
+            let gs = start.gs as f64 / 10.0 + kt_s * s;
+            let on_ground = start.alt == GROUND;
+            let p = Point {
+                t: start.t + ms,
+                // (north at the ground speed: only the ground rule looks)
+                lat: start.lat + (start.gs as f64 / 10.0 * 0.514_444 * s / 0.111_195).round() as i32,
+                alt: if on_ground { GROUND } else { ((start.alt as f64 + ft_min * s / 60.0) / 25.0).round() as i32 * 25 },
+                gs: (gs * 10.0).round() as u16,
+                track: if start.track == u16::MAX { u16::MAX } else { (((start.track as f64 / 10.0 + deg_s * s).rem_euclid(360.0)) * 10.0).round() as u16 },
+                ..start
+            };
+            if due(&last, &p, interval, false) {
+                gaps.push((p.t - last.t) as f64 / 1000.0);
+                last = p;
+            }
+            ms += period_ms;
+        }
+        gaps.remove(0);
+        gaps
+    }
+
+    fn at(alt: i32) -> Point {
+        Point { t: T, lat: 45_000_000, lon: 9_000_000, alt, alt_geom: NONE, gs: 3000, track: 900, rate: 0, geom_rate: i16::MIN, ias: u16::MAX, flags: 0, addr_type: 0 }
+    }
+
+    /// The spacing a flight settles to. (Altitude comes in 25 ft steps:
+    /// the first points of a slow climb can come a step early, until
+    /// each falls just after a step, on readsb as here.)
+    fn all(gaps: &[f64], want: f64) -> bool {
+        gaps.len() >= 3 && gaps[gaps.len() - 3..].iter().all(|g| *g == want)
+    }
+
+    #[test]
+    fn steady_flight_gets_a_point_every_interval_and_a_new_aircraft_one_a_second() {
+        assert!(all(&fly(at(30_000), 300.0, 0.0, 0.0, 0.0, 30_000, 500), 30.0));
+        assert!(all(&fly(at(30_000), 300.0, 0.0, 0.0, 0.0, 10_000, 500), 10.0));
+        let (last, mut p) = (at(30_000), at(30_000));
+        // the dense minute: every second, whatever the positions' own rate
+        p.lon += 2000;
+        p.t += 500;
+        assert!(!due(&last, &p, 30_000, true));
+        p.t += 500;
+        assert!(due(&last, &p, 30_000, true) && !due(&last, &p, 30_000, false));
+        // standing on the ground: every three seconds, then every interval
+        let (mut last, mut p) = (at(GROUND), at(GROUND));
+        (last.gs, p.gs) = (0, 0);
+        p.t += 2500;
+        assert!(!due(&last, &p, 30_000, true));
+        p.t += 500;
+        assert!(due(&last, &p, 30_000, true) && !due(&last, &p, 30_000, false));
+        p.t = T + 29_500;
+        assert!(!due(&last, &p, 30_000, false));
+        p.t = T + 30_000;
+        assert!(due(&last, &p, 30_000, false));
+        // (at an interval of 10 s readsb kept one every 18 to 20)
+        p.t = T + 19_500;
+        assert!(!due(&last, &p, 10_000, false));
+        p.t = T + 20_000;
+        assert!(due(&last, &p, 10_000, false));
+    }
+
+    /// The spacings readsb kept for the same climbs (interval 30 s).
+    #[test]
+    fn a_climb_gets_a_point_every_75_200_or_375_ft_by_altitude() {
+        // 1,000 ft/min: every 4.5 s low, 11 s between 7,000 and 12,000 ft, 19.5 s above
+        assert!(all(&fly(at(1000), 120.0, 1000.0, 0.0, 0.0, 30_000, 500), 4.5));
+        assert!(all(&fly(at(8000), 120.0, 1000.0, 0.0, 0.0, 30_000, 500), 11.0));
+        assert!(all(&fly(at(15_000), 120.0, 1000.0, 0.0, 0.0, 30_000, 500), 19.5));
+        assert!(all(&fly(at(20_000), 120.0, -1000.0, 0.0, 0.0, 30_000, 500), 19.5));
+        // fast: the altitude alone decides
+        assert!(all(&fly(at(15_000), 120.0, 3000.0, 0.0, 0.0, 30_000, 500), 7.5));
+        assert!(all(&fly(at(7500), 60.0, 3000.0, 0.0, 0.0, 30_000, 500), 4.0));
+        assert!(all(&fly(at(1000), 60.0, 3000.0, 0.0, 0.0, 30_000, 500), 1.5));
+        // slow: less altitude is enough once it has taken long
+        assert!(all(&fly(at(13_000), 200.0, 500.0, 0.0, 0.0, 30_000, 500), 27.0));
+        assert!(all(&fly(at(13_000), 200.0, 400.0, 0.0, 0.0, 30_000, 500), 30.0));
+        assert!(all(&fly(at(7100), 200.0, 500.0, 0.0, 0.0, 30_000, 500), 15.5));
+        assert!(all(&fly(at(500), 600.0, 150.0, 0.0, 0.0, 30_000, 500), 20.0));
+        // and sooner at a shorter interval: 1,200 ft/min above 12,000 ft
+        // was a point every 17.5 s at 30 and every 15 s at 20
+        assert!(all(&fly(at(13_000), 120.0, 1200.0, 0.0, 0.0, 30_000, 500), 17.5));
+        assert!(all(&fly(at(13_000), 120.0, 1200.0, 0.0, 0.0, 20_000, 500), 15.0));
+    }
+
+    #[test]
+    fn the_bands_change_just_above_7000_and_12000_ft() {
+        let p = |alt: i32, s: u64| Point { t: T + s * 1000, ..at(alt) };
+        // 75 ft in 4 s: kept at 7,000 ft, not at 7,050
+        assert!(due(&p(6925, 0), &p(7000, 4), 30_000, false));
+        assert!(!due(&p(6975, 0), &p(7050, 4), 30_000, false));
+        // 200 ft in 4 s: kept at 11,975 ft, not at 12,175
+        assert!(due(&p(11_775, 0), &p(11_975, 4), 30_000, false));
+        assert!(!due(&p(11_975, 0), &p(12_175, 4), 30_000, false));
+        // without a barometric altitude the geometric one is used
+        let g = |alt: i32, s: u64| Point { alt: NONE, alt_geom: alt, ..p(0, s) };
+        assert!(due(&g(20_000, 0), &g(20_375, 4), 30_000, false));
+        assert!(!due(&g(20_000, 0), &g(20_350, 4), 30_000, false));
+    }
+
+    /// Degrees a second and the seconds between points readsb kept.
+    #[test]
+    fn a_turn_gets_points_the_sooner_the_faster_it_is() {
+        for (rate, want) in [(0.1, 13.5), (0.15, 11.0), (0.2, 9.5), (0.25, 8.5), (0.5, 6.0), (0.7, 5.0), (1.0, 4.0), (1.5, 3.5), (2.0, 3.0), (2.5, 2.5), (3.0, 2.5), (4.0, 2.0), (6.0, 1.5), (7.0, 1.5), (8.0, 1.5), (10.0, 1.0), (14.0, 1.0)] {
+            let gaps = fly(at(30_000), 90.0, 0.0, rate, 0.0, 30_000, 500);
+            assert!(gaps.iter().all(|g| *g == want), "{rate} degrees a second: {gaps:?}");
+        }
+        // the same at any speed and interval
+        let slow = Point { gs: 1000, ..at(3000) };
+        assert!(all(&fly(slow, 60.0, 0.0, 1.0, 0.0, 10_000, 500), 4.0));
+        // straight on, or no track: nothing
+        let none = Point { track: u16::MAX, ..at(30_000) };
+        assert!(all(&fly(none, 150.0, 0.0, 1.0, 0.0, 30_000, 500), 30.0));
+    }
+
+    #[test]
+    fn a_change_of_10_kt_or_of_200_ft_a_minute_gets_a_point() {
+        // 0.5 kt/s: every 20 s; 0.2 kt/s is 6 kt in an interval: nothing
+        assert!(all(&fly(at(30_000), 120.0, 0.0, 0.0, 0.5, 30_000, 500), 20.0));
+        assert!(all(&fly(at(30_000), 120.0, 0.0, 0.0, 0.2, 30_000, 500), 30.0));
+        assert!(all(&fly(at(30_000), 30.0, 0.0, 0.0, 3.0, 30_000, 500), 3.5));
+        // vertical rate, as readsb in live traffic: 224 ft/min apart kept, 192 not
+        let (last, mut p) = (at(37_000), at(37_000));
+        p.t += 500;
+        p.rate = 192;
+        assert!(!due(&last, &p, 30_000, false));
+        p.rate = -224;
+        assert!(due(&last, &p, 30_000, false));
+        p.rate = i16::MIN;
+        assert!(!due(&last, &p, 30_000, false));
+    }
+
+    /// Knots on the ground and the seconds between the points readsb kept.
+    #[test]
+    fn on_the_ground_points_come_the_sooner_the_faster_it_rolls() {
+        for (kt, want) in [(1.0, 18.0), (2.0, 9.0), (5.0, 3.5), (10.0, 3.5), (20.0, 3.5), (30.0, 2.5), (40.0, 1.5), (50.0, 1.5), (60.0, 1.0), (70.0, 1.0), (90.0, 0.5), (140.0, 0.5)] {
+            let start = Point { gs: (kt * 10.0) as u16, ..at(GROUND) };
+            let gaps = fly(start, 90.0, 0.0, 0.0, 0.0, 30_000, 500);
+            assert!(gaps.iter().all(|g| *g == want), "{kt} kt: {gaps:?}");
+            // turning as it goes: the same
+            assert_eq!(fly(start, 90.0, 0.0, 3.0, 0.0, 30_000, 500), gaps);
+        }
+        // at an interval of 10 s the slow ones come sooner: 2.5 s
+        assert!(all(&fly(Point { gs: 150, ..at(GROUND) }, 60.0, 0.0, 0.0, 0.0, 10_000, 500), 2.5));
+        // leaving the ground and reaching it are points whenever they happen
+        let (g, mut a) = (at(GROUND), at(300));
+        a.t += 500;
+        assert!(due(&g, &a, 30_000, false) && due(&Point { t: T, ..a }, &Point { t: T + 500, ..g }, 30_000, false));
+    }
+
+    fn aircraft(alt: i32) -> Aircraft {
+        let mut a = Aircraft::new(0x4ca123, T - 120_000);
+        a.alt_baro = F { v: alt, t: T, src: Source::Adsb, long: false };
+        a.gs = F { v: 300.0, t: T, src: Source::Adsb, long: false };
+        a.track = F { v: 90.0, t: T, src: Source::Adsb, long: false };
+        a
+    }
+
+    /// A position every half second from `from` to `to` seconds.
+    fn hear(a: &mut Aircraft, from: f64, to: f64, interval: Ms) {
+        let mut ms = (from * 1000.0) as u64;
+        while ms as f64 <= to * 1000.0 {
+            let now = T + ms;
+            a.pos = F { v: (45.0, 9.0 + ms as f64 * 1e-6), t: now, src: Source::Adsb, long: false };
+            (a.alt_baro.t, a.gs.t, a.track.t) = (now, now, now);
+            add(a, now, interval);
+            ms += 500;
+        }
+    }
+
+    fn kept(a: &Aircraft) -> Vec<(f64, u8)> {
+        a.trace.all().0.iter().map(|p| ((p.t() - T) as f64 / 1000.0, p.unpack().flags)).collect()
+    }
+
+    /// As readsb with the same gaps in a steady flight: 9 s of silence
+    /// leaves no mark, from 10 s the position heard last before it is a
+    /// point, from 15 s the first one after it is too, marked stale.
+    #[test]
+    fn a_silence_keeps_the_last_position_before_it_and_marks_the_first_after_it() {
+        let mut a = aircraft(30_000);
+        hear(&mut a, 0.0, 40.0, 30_000);
+        hear(&mut a, 49.0, 100.0, 30_000);
+        assert_eq!(kept(&a), [(0.0, FLAG_STALE), (30.0, 0), (60.0, 0), (90.0, 0)]);
+        let mut a = aircraft(30_000);
+        hear(&mut a, 0.0, 40.0, 30_000);
+        hear(&mut a, 52.0, 100.0, 30_000);
+        assert_eq!(kept(&a), [(0.0, FLAG_STALE), (30.0, 0), (40.0, 0), (70.0, 0), (100.0, 0)]);
+        let mut a = aircraft(30_000);
+        hear(&mut a, 0.0, 40.0, 30_000);
+        hear(&mut a, 55.0, 100.0, 30_000);
+        assert_eq!(kept(&a), [(0.0, FLAG_STALE), (30.0, 0), (40.0, 0), (55.0, FLAG_STALE), (85.0, 0)]);
+    }
+
+    /// An aircraft that is not heard again: its trace ends where it was
+    /// last heard, once ten seconds have shown that it is gone.
+    #[test]
+    fn a_trace_ends_at_the_last_position_heard() {
+        let mut a = aircraft(30_000);
+        hear(&mut a, 0.0, 47.5, 30_000);
+        settle(&mut a, T + 52_000);
+        assert_eq!(kept(&a).last(), Some(&(30.0, 0)));
+        settle(&mut a, T + 58_000);
+        assert_eq!(kept(&a).last(), Some(&(47.5, 0)));
+        // once only, and it is the point the next position is measured from
+        settle(&mut a, T + 70_000);
+        assert_eq!(kept(&a).len(), 3);
+        hear(&mut a, 77.5, 80.0, 30_000);
+        assert_eq!(kept(&a)[3..], [(77.5, FLAG_STALE)]);
+    }
+
+    /// readsb: after take-off at 140 kt, and after landing at 20 and at
+    /// 60 kt, a point a second for a minute; then the usual rule.
+    #[test]
+    fn leaving_or_reaching_the_ground_starts_a_minute_of_points_a_second() {
+        let mut a = aircraft(1500);
+        hear(&mut a, 0.0, 100.0, 30_000);
+        assert_eq!(kept(&a).len(), 4);
+        a.ground = F { v: true, t: T + 100_000, src: Source::Adsb, long: false };
+        a.gs.v = 20.0;
+        let mut ms = 100_500;
+        while ms <= 220_000 {
+            (a.ground.t, a.gs.t) = (T + ms, T + ms);
+            a.pos = F { v: (45.0, 9.1 + ms as f64 * 1e-7), t: T + ms, src: Source::Adsb, long: false };
+            add(&mut a, T + ms, 30_000);
+            ms += 500;
+        }
+        let k = kept(&a);
+        // the last 96 positions in the air and at touchdown, every one:
+        // 53 s to 100.5 s, where there had been a point every 30 s
+        assert_eq!(k[..3], [(0.0, FLAG_STALE), (30.0, 0), (53.0, 0)]);
+        assert!(k[2..98].windows(2).all(|w| w[1].0 - w[0].0 == 0.5), "{k:?}");
+        // touchdown, then 59 more a second apart, then as any aircraft
+        // rolling at 20 kt, every 3.5 s
+        assert_eq!(k[97].0, 100.5);
+        assert!(k[97..157].windows(2).all(|w| w[1].0 - w[0].0 == 1.0), "{k:?}");
+        assert!(k.len() > 170 && k[156..].windows(2).all(|w| w[1].0 - w[0].0 == 3.5), "{k:?}");
+        assert!(a.trace_ring.is_none());
+    }
+
+    /// Nothing is held back for an aircraft too high to be landing, and
+    /// what was held is dropped when it climbs away.
+    #[test]
+    fn only_an_aircraft_low_enough_to_land_has_its_newest_positions_held() {
+        let mut a = aircraft(30_000);
+        hear(&mut a, 0.0, 10.0, 30_000);
+        assert!(a.trace_ring.is_none());
+        a.alt_baro.v = 14_000;
+        hear(&mut a, 10.5, 20.0, 30_000);
+        assert!(a.trace_ring.is_some());
+        a.alt_baro.v = 15_000;
+        hear(&mut a, 20.5, 21.0, 30_000);
+        assert!(a.trace_ring.is_none());
+    }
+
+    /// A parked aircraft says the same thing every time, which the
+    /// tracker takes for one transmission heard again: its trace gets a
+    /// point every interval all the same (readsb: every 30 s), none of
+    /// them marked stale; and a relay through a second receiver, right
+    /// behind the first, is not a position of its own.
+    #[test]
+    fn an_aircraft_standing_still_is_recorded_as_it_stands() {
+        let mut a = aircraft(1500);
+        a.ground = F { v: true, t: T, src: Source::Adsb, long: false };
+        a.gs.v = 0.0;
+        a.pos = F { v: (45.0, 9.0), t: T, src: Source::Adsb, long: false };
+        add(&mut a, T, 30_000);
+        let mut ms = 500;
+        while ms <= 100_000 {
+            let now = T + ms;
+            (a.ground.t, a.gs.t, a.pos.t) = (now, now, now);
+            again(&mut a, now, 30_000);
+            // the same frame from another receiver, 50 ms on
+            a.pos.t = now + 50;
+            again(&mut a, now + 50, 30_000);
+            ms += 500;
+        }
+        assert_eq!(kept(&a), [(0.0, FLAG_STALE), (30.0, 0), (60.0, 0), (90.0, 0)]);
+    }
+
+    /// readsb, an aircraft that touched down 30 s after it was first
+    /// heard: a point a second up to the landing, as for any new
+    /// aircraft, not every position.
+    #[test]
+    fn a_landing_in_the_first_minute_adds_nothing_to_the_points_a_second() {
+        let mut a = aircraft(100);
+        a.trace_dense_until = T + DENSE_MS;
+        hear(&mut a, 0.0, 30.0, 30_000);
+        a.ground = F { v: true, t: T + 30_500, src: Source::Adsb, long: false };
+        a.pos = F { v: (45.0, 9.1), t: T + 30_500, src: Source::Adsb, long: false };
+        add(&mut a, T + 30_500, 30_000);
+        let k = kept(&a);
+        assert_eq!(k.len(), 32);
+        assert!(k[..31].windows(2).all(|w| w[1].0 - w[0].0 == 1.0) && k[31].0 == 30.5, "{k:?}");
+    }
+
+    /// Every fourth point says what else was known, and the served
+    /// trace shows it at that point, whatever millisecond it was heard at.
+    #[test]
+    fn one_point_in_four_carries_the_detail_and_it_is_served() {
+        let mut a = aircraft(30_000);
+        a.callsign = F { v: *b"AZA1234 ", t: T, src: Source::Adsb, long: false };
+        for i in 0..20u64 {
+            let now = T + i * 30_000 + 37 * i + 5;
+            a.pos = F { v: (45.0, 9.0 + i as f64 * 0.05), t: now, src: Source::Adsb, long: false };
+            (a.alt_baro.t, a.gs.t, a.track.t, a.callsign.t) = (now, now, now, now);
+            add(&mut a, now, 30_000);
+        }
+        let (points, details) = a.trace.all();
+        assert_eq!((points.len(), details.len()), (20, 5));
+        let mut out = String::new();
+        render(a.addr, None, &points, &details, &mut out);
+        let rows: Vec<&str> = out.lines().filter(|l| l.starts_with('[')).collect();
+        let with: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.contains("\"flight\":\"AZA1234 \"")).map(|(i, _)| i).collect();
+        assert_eq!(with, [0, 4, 8, 12, 16]);
+        assert_eq!(rows.len(), 20);
+    }
+
+    /// The same as its first minute: an aircraft is new for 60 s after
+    /// it is first heard (readsb, with positions 0.3, 0.5, 1 and 2.5 s
+    /// apart: points 0.9, 1, 1 and 2.5 s apart until the 60th second).
+    #[test]
+    fn a_new_aircraft_has_a_point_a_second_for_its_first_minute() {
+        let mut a = aircraft(30_000);
+        a.created = T;
+        a.trace_dense_until = T + DENSE_MS;
+        hear(&mut a, 2.0, 125.0, 30_000);
+        let k = kept(&a);
+        assert_eq!((k[0].0, k[57].0, k[58].0, k[59].0), (2.0, 59.0, 89.0, 119.0));
+        assert_eq!(k.len(), 60);
     }
 }

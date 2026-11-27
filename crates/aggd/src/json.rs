@@ -163,7 +163,11 @@ pub fn aircraft(o: &mut String, a: &Aircraft, v: &View<'_>, extra: Option<(f64, 
     }
     if let Some(x) = a.track.get(now) {
         let _ = write!(o, ",\"track\":{x:.2}");
-    } else if let Some(x) = a.calc_track.get(now) {
+    } else if a.pos.valid(now) && !(a.on_ground(now) && a.true_heading_at(now).is_some()) {
+        // readsb shows one for every placed aircraft that reports no
+        // track (not for one on the ground that gives its heading):
+        // north until two positions 100 m apart have given it
+        let x = if a.calc_track.t != 0 { a.calc_track.v } else { 0.0 };
         let _ = write!(o, ",\"calc_track\":{x:.0}");
     }
     if let Some(x) = a.track_rate.get(now) {

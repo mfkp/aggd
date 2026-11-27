@@ -72,10 +72,10 @@ Leave it for a few days. Watch `/metrics` on aggd: memory
 | `--net-api-port=PORT` | the same (or `--http-port`; one server answers both) |
 | `--write-json=DIR` + nginx serving `/data/` | `--http-port PORT` serves them from memory. `--write-json DIR` also writes `aircraft.json`, `receiver.json`, `stats.json`, `status.json`, `clients.json` and `receivers.json` to DIR every `--write-json-every` seconds (the directory is created; a failure to write is logged once), for bots and scripts that read from disk. readsb also keeps each aircraft's trace there when it keeps traces; with `--write-traces` aggd does too (`traces/xx/trace_recent_HEX.json` and `trace_full_HEX.json`, gzipped, rewritten as the trace grows) |
 | `--write-json-globe-index`, binCraft, zstd | always on, rendered on request |
-| `--write-globe-history=DIR`, `--write-state=DIR` | the same. aggd's state file is its own format: it does not read readsb's, so traces start empty on the first run |
+| `--write-globe-history=DIR`, `--write-state=DIR` | the same. aggd's state files are its own format: it does not read readsb's, so traces start empty on the first run. Stopping and starting: step 6 |
 | `--db-file`, `--db-file-lt` | the same |
-| `--json-trace-interval`, `--interactive-ttl` | the same |
-| `--net-receiver-id`, `--uuid`, outbound `beast_reduce_plus_out` to a hub | the same; the hub lists the edge under `--net-trusted` |
+| `--json-trace-interval`, `--interactive-ttl` | the same; the interval is 30 s when not given, as readsb's is (it was 20 s at first), and the points kept between intervals follow readsb's rule (README, "Known differences") |
+| `--net-receiver-id`, `--uuid`, outbound `beast_reduce_plus_out` to a hub | the same; the hub lists the edge under `--net-trusted`. As with readsb, `--net-receiver-id` also names the receiver on the full and the reduced Beast outputs (`--net-bo-port`, `--net-beast-reduce-out-port`, `beast_out` and `beast_reduce_out` connectors): one marker, `0x1a 0xe3` and the eight-byte id, before each batch of frames from a receiver. A receiver that gave no UUID has an id aggd makes up for the connection (`ffff…`), where readsb derives one of its own; ids arriving on a link are passed on only from links under `--net-trusted` |
 | `--net-ingest` | accepted; aggd's own protections are always on (README) |
 | `--heatmap`, `--heatmap-dir` | the same |
 | `--modeac` | accepted; like readsb on an aggregator it shows nothing |
@@ -128,3 +128,63 @@ unknown ones are reported and refuse to start; the ones in the table that
 are "not there" must be removed). Keep readsb's configuration: going back
 is stopping aggd and starting readsb. The `globe_history` directory is
 shared in format, so history written by either is readable by tar1090.
+
+## 6. Stopping and starting
+
+On SIGTERM aggd does two things, in this order, and says how long each
+took:
+
+1. It saves the state (`--write-state`): what the traces have gained
+   since the last hourly save, in `state.add` beside the hourly
+   `state.bin`. That is less than a tenth of the table (72 MB of 950)
+   and takes about a second. From then on nothing is lost, whatever
+   happens to the process.
+2. It brings the day files up to date (`--write-globe-history`): the file
+   of every aircraft heard since its last ten-minute pass, which at a
+   busy hour is every aircraft in the air. This is processor time, shared
+   over all cores.
+
+With 75,000 aircraft kept (76 million points, a table of 950 MB) and
+17,400 of them in the air, on a six-core desktop processor of 2020 held
+to four cores: 1 s for the state and 12 s for 18,600 day files; to eight
+threads, 7 s in all; to two cores, 27 s. Before, the same took 85 s on
+that machine whatever the cores (one operator saw 109 s on his): the day
+files were written on one core, and then the whole state, recompressed.
+
+So `TimeoutStopSec=60` in `deploy/aggd.service` is enough for that size
+on four cores or more. Allow 1 s for every 400 aircraft in the air,
+divided by the number of cores, and twice that on a slow machine.
+Docker's default is 10 s, which is not: use `docker stop -t 60`, or
+`stop_grace_period: 1m` in a compose file.
+
+If the time runs out anyway and aggd is killed during step 2, the day
+files it had not reached are written by the next start, from the state:
+each aircraft's count of points not yet in a day file is part of it.
+Killed during step 1 (or by a crash, or the power), the state on disk is
+the last one that was finished: every state file is written under
+another name and renamed when it is whole, so there is never half of
+one, and a file that does not check out against its checksums is refused
+rather than read. (`state.add` is not waited for to reach the disk,
+which on a busy one took up to 15 s: if the machine loses power within
+seconds of a stop, the start after may find it incomplete, say so, and
+restore the hourly save alone.) After a crash the traces served lack at most the hour
+since the last `state.bin`, and the day files at most the ten minutes
+since their last pass.
+
+Starting reads the state back as it is: under a second for that table
+(before: 19 s, with the whole file and its 2.7 GB of unpacked points in
+memory at once, 5 GB at the peak). Restored aircraft are unlisted until
+heard again; their traces are served at once.
+
+The first start after upgrading reads the `state.zst` of the version
+before, which takes as long as it did then (17 s for that table, though
+no longer 5 GB), and one minute later writes the first `state.bin`. A stop in that first minute writes
+the whole state rather than an addition to it: a gigabyte, which is as
+fast as the disk. `state.zst` is left where it is for a day, so that
+going back within the day still finds its traces (as of the upgrade),
+and is then removed. The version before cannot read the new files.
+
+With `--write-traces`, the files in `traces/` are not completed when
+stopping, and all of them are written again after a start (a minute or two
+minutes for 150,000 files on four cores); until then some are as old as
+the stop.

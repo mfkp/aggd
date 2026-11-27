@@ -13,7 +13,10 @@ EnvironmentFile=-/etc/default/aggd
 ExecStart=/usr/local/bin/aggd $AGGD_ARGS
 Restart=always
 RestartSec=2
-# aggd saves its traces on SIGTERM; give it time on a large table
+# On SIGTERM aggd saves what its traces gained since the hourly state
+# file (under a second), then brings the day files up to date (about 10 s
+# on four cores with 75,000 aircraft kept). Killed during the second,
+# nothing is lost: the next start writes them. docs/MIGRATING.md, step 6.
 TimeoutStopSec=60
 LimitNOFILE=65536
 StateDirectory=aggd

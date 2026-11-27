@@ -225,6 +225,15 @@ pub struct Aircraft {
     pub pos_rx: u64,
     pub pos_surface: bool,
     pos_bad: u8,
+    /// messages from elsewhere that more receivers relayed than stand
+    /// behind the track
+    outvoted: u8,
+    /// position fixes from an even and an odd message that fitted the
+    /// track, since it began: after a few the track is established
+    pos_globals: u8,
+    /// the track was dropped for messages from elsewhere: the next fix
+    /// needs a second to agree before it places the aircraft
+    restarted: bool,
     /// when the position was last backed by a second receiver hearing
     /// the same transmission
     pub pos_confirmed: Ms,
@@ -285,6 +294,14 @@ pub struct Aircraft {
     pub db: Option<std::sync::Arc<crate::db::Entry>>,
     pub db_checked: bool,
     pub trace: crate::trace::Trace,
+    /// the position heard last, whether or not the trace kept it
+    pub trace_prev: Option<crate::trace::Packed>,
+    /// until when the trace keeps a point every second
+    pub trace_dense_until: Ms,
+    /// trace points since the last that said what else was known
+    pub trace_plain: u8,
+    /// its newest positions, while it is low enough to be landing
+    pub trace_ring: Option<Box<crate::trace::Ring>>,
     /// Where the aircraft was before it was forgotten: nothing shown,
     /// only a rough place for surface messages to be read against.
     pub last_place: Option<(f64, f64)>,
@@ -368,6 +385,9 @@ impl Aircraft {
             pos_rx: 0,
             pos_surface: false,
             pos_bad: 0,
+            outvoted: 0,
+            pos_globals: 0,
+            restarted: false,
             pos_confirmed: 0,
             suspect: None,
             blame_due: ([0; 4], 0),
@@ -399,6 +419,10 @@ impl Aircraft {
             db: None,
             db_checked: false,
             trace: crate::trace::Trace::default(),
+            trace_prev: None,
+            trace_dense_until: now + crate::trace::DENSE_MS,
+            trace_plain: 0,
+            trace_ring: None,
             last_place: None,
         }
     }
@@ -472,12 +496,63 @@ impl Aircraft {
         self.pos_wit.iter().filter(|w| w.0 != 0 && t.wrapping_sub(w.1) < 10_000).count() as u8
     }
 
+    /// A few fixes in a row have fitted the track.
+    fn established(&self) -> bool {
+        self.pos_globals >= ESTABLISHED
+    }
+
+    /// A message from where the aircraft cannot be was really sent (a
+    /// second receiver heard it, or the track has no one's backing).
+    /// While the track's own messages keep coming it counts for nothing:
+    /// two aircraft under one address, a replayed recording, a decode
+    /// from halves that do not belong together. Measured on readsb with
+    /// two aircraft under one address, 60 to 9,000 km apart: the first
+    /// stays for as long as it is heard, through ten seconds of the
+    /// other alone; when it stops, the second is shown 8 to 45 s later,
+    /// sooner the more often it is heard (about seven seconds and
+    /// seventeen messages). So here: once the track has been quiet for
+    /// `QUIET`, `START_OVER` such messages drop it, and the aircraft is
+    /// placed anew.
+    fn refused(&mut self, now: Ms) {
+        let held = self.established() || (self.pos_confirmed != 0 && now.saturating_sub(self.pos_confirmed) < 30_000);
+        if held && now.saturating_sub(self.pos.t.max(self.pos_confirmed)) < QUIET {
+            return;
+        }
+        self.pos_bad += 1;
+        if self.pos_bad >= if held { START_OVER } else { 5 } {
+            self.start_over();
+        }
+    }
+
+    /// The track is no longer believed. It is shown until a new place
+    /// is found (as readsb goes from one straight to the other), and is
+    /// still the rough place surface messages are read against: better
+    /// than where the aircraft last went quiet, which may be the far end
+    /// of the flight it has just made. Where it last stood is kept
+    /// against a fix that never became a track, though: that may be
+    /// another aircraft under the same address.
+    fn start_over(&mut self) {
+        self.pos_bad = 0;
+        self.outvoted = 0;
+        if self.established() || self.last_place.is_none() {
+            self.last_place = Some(self.pos.v);
+        }
+        self.pos_confirmed = 0;
+        self.pos_globals = 0;
+        self.restarted = true;
+        self.far = None;
+        self.suspect = None;
+        self.cpr = [RxCpr::default(); CPR_ROWS];
+    }
+
     /// Another receiver heard the suspect message too: the aircraft
-    /// really sent it, or these receivers err together. Against an
-    /// unconfirmed position it wins at once. Against a confirmed one it
-    /// counts only once more receivers relay it than half of those
-    /// standing behind the track, and the track moves after a few such
-    /// messages: the many are believed over the few.
+    /// really sent it, or these receivers err together. Against a
+    /// position no second receiver confirmed and no run of fixes
+    /// established, it wins at once. Against any other it wins only when
+    /// more receivers relay it than stand behind the track, after a few
+    /// such messages: the many are believed over the few. Equal numbers
+    /// are two aircraft under one address, and the first is kept (see
+    /// `refused`).
     #[inline]
     pub fn corroborate_suspect(&mut self, key: u64, rx: u64, now: Ms) -> bool {
         let Some(mut s) = self.suspect else { return false };
@@ -491,19 +566,30 @@ impl Aircraft {
             s.wit[s.n as usize] = rx;
             s.n += 1;
         }
-        if s.strong {
-            if s.n < 2 || (s.n as u16) * 2 <= self.witnesses(now) as u16 {
+        if s.strong || self.established() {
+            // the aircraft, or one under the same address, did send it
+            if s.n == 2 {
+                self.refused(now);
+            }
+            if s.n < 2 || s.n <= self.witnesses(now) {
                 self.suspect = Some(s);
                 return false;
             }
             self.suspect = None;
-            self.pos_bad += 1;
-            if self.pos_bad < 3 {
+            self.outvoted += 1;
+            if self.outvoted < 3 {
                 return false;
             }
         }
         self.suspect = None;
+        if !s.global {
+            // read against the very place it contradicts, it says only
+            // that the aircraft is not there
+            self.start_over();
+            return false;
+        }
         adopt(self, s.lat, s.lon, &s.cpr, s.src, now, s.rx);
+        self.pos_globals = 1;
         self.pos_confirmed = now;
         self.pos_wit = [(0, 0); 6];
         for w in &s.wit[..s.n as usize] {
@@ -523,7 +609,9 @@ impl Aircraft {
         match self.suspect {
             Some(s) if (now as u32).wrapping_sub(s.t) > BLAME_AFTER => {
                 self.suspect = None;
-                if s.strong {
+                // heard by two or more and not plainly outnumbered: an
+                // aircraft sent it, and no receiver is at fault
+                if s.strong && (s.n < 2 || s.n as u16 * 2 <= self.witnesses(now) as u16) {
                     (s.wit, s.n)
                 } else {
                     ([0; 4], 0)
@@ -620,7 +708,7 @@ impl Aircraft {
             return None;
         }
         // a device that is not a transponder is shown its version while its squitters last
-        let own = matches!(self.addr_type, AddrType::AdsbIcao | AddrType::ModeS) || self.addr_type_t == 0;
+        let own = matches!(self.addr_type, AddrType::AdsbIcao | AddrType::ModeS | AddrType::Other) || self.addr_type_t == 0;
         (own || now.saturating_sub(self.es_seen) <= ES_TTL).then_some(self.version)
     }
 
@@ -722,7 +810,11 @@ pub fn apply(a: &mut Aircraft, m: &Msg, signal: u8, now: Ms, rx: u64, rx_ref: Op
             } else if m.df == 17 && ran_out {
                 a.ver_t = now;
             }
-        } else if a.version >= 0 && ran_out {
+        } else if a.version >= 0 && ran_out && a.addr_type != AddrType::Other {
+            // (not one a BaseStation feed places: beside readsb its
+            // version was still shown 130 s after its last squitter,
+            // and never blinked while they went on;
+            // tools/sbs_src_probe.py)
             a.version = -1;
         }
     }
@@ -992,6 +1084,28 @@ struct Suspect {
     src: Source,
     /// the position it contradicts was itself confirmed
     strong: bool,
+    /// decoded from a pair, not read against the place it contradicts
+    global: bool,
+}
+
+/// The direction from the place before to this one, kept whether or
+/// not a track is reported: it is shown when none is. Measured on readsb
+/// with MLAT positions alone (tools/mlat_track_probe.py): the direction
+/// changes only on a step of 100 m or more from one position to the
+/// next, so an aircraft at 450 kt has it from its second position, one
+/// at 60 kt heard every second never, and one standing still in 60 m of
+/// jitter now and then.
+fn track_from(a: &mut Aircraft, before: Option<(f64, f64)>, lat: f64, lon: f64, src: Source, now: Ms) {
+    if let Some((plat, plon)) = before {
+        let d = dist_m(plat, plon, lat, lon);
+        if d >= 100.0 && d < 50_000.0 {
+            // (due north is 360 there, 0 being the aircraft that has none yet)
+            let b = bearing(plat, plon, lat, lon) as f32;
+            a.calc_track.v = if b < 0.5 { 360.0 } else { b };
+            a.calc_track.t = now;
+            a.calc_track.src = src;
+        }
+    }
 }
 
 /// Make (lat, lon) the aircraft's position.
@@ -1000,12 +1114,15 @@ fn adopt(a: &mut Aircraft, lat: f64, lon: f64, c: &Cpr, src: Source, now: Ms, rx
     a.pos.v = (lat, lon);
     a.pos.t = now;
     a.pos.src = src;
-    if let Some((plat, plon)) = before {
-        let d = dist_m(plat, plon, lat, lon);
-        // kept whether or not a track is reported: it is shown when none is
-        if d > 40.0 && d < 50_000.0 {
-            a.calc_track.accept(bearing(plat, plon, lat, lon) as f32, src, now);
-        }
+    track_from(a, before, lat, lon, src, now);
+    if before.is_none() {
+        // readsb's direction for a first position of the aircraft's own
+        // is the one from 0 N 0 E (9 for an aircraft over Milan with no
+        // place before, on the one-message probe), and for one placed
+        // from elsewhere 0
+        a.calc_track.v = bearing(0.0, 0.0, lat, lon) as f32;
+        a.calc_track.t = now;
+        a.calc_track.src = src;
     }
     let (nic, rc) = modes::nic_rc(c, a.version.max(0) as u8, a.nic_a, a.nic_c);
     a.nic = nic;
@@ -1013,6 +1130,8 @@ fn adopt(a: &mut Aircraft, lat: f64, lon: f64, c: &Cpr, src: Source, now: Ms, rx
     a.pos_rx = rx;
     a.pos_surface = c.surface;
     a.pos_bad = 0;
+    a.outvoted = 0;
+    a.restarted = false;
     a.far = None;
     a.anchor = if a.by_trusted { (now as u32).max(1) } else { 0 };
     a.pos_trusted = a.by_trusted;
@@ -1042,6 +1161,15 @@ fn reach_m(a: &Aircraft, surface: bool, now: Ms, dt: f64) -> f64 {
 const SOLVED_SLACK_M: f64 = 20_000.0;
 /// How long a far decode waits for another to agree with it.
 const FAR_HOLD: Ms = 10_000;
+/// How far from the aggregator's own location a surface position read
+/// against it is believed: what one receiver there could hear.
+const SITE_REACH_M: f64 = 500_000.0;
+/// Fixes that fitted before a track holds against messages from elsewhere.
+const ESTABLISHED: u8 = 3;
+/// How long a track must have had no message of its own before
+/// messages from elsewhere count against it, and how many then drop it.
+const QUIET: Ms = 7_000;
+const START_OVER: u8 = 17;
 
 fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Option<(f64, f64)>, frame_key: u64) -> Pos {
     // Both fields zero is a transponder with no fix saying so in a
@@ -1065,7 +1193,10 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
         // age here, a parked aircraft's place went stale and a solved
         // position from elsewhere took it over).
         if a.pos.src == src {
+            a.restarted = false;
             a.pos.t = now;
+            // and a message believed once, said again, fits the track
+            a.pos_globals = a.pos_globals.saturating_add(1);
         }
         a.confirm_position(rx, now);
         return Pos::Duplicate;
@@ -1088,7 +1219,7 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     a.cpr[row].slots[i] = CprSlot { c: Some(*c), t: now };
     let mut other = a.cpr[row].slots[1 - i];
     let window = if c.surface { PAIR_SURFACE } else { pair_airborne(a, now) };
-    let have_pos = a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 600_000;
+    let have_pos = !a.restarted && a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 600_000;
     // An aircraft that is nowhere yet may be placed from halves heard
     // by two receivers, as readsb does: at the edge of coverage each may
     // catch only one. Once it has a place, a receiver's halves pair only
@@ -1113,7 +1244,14 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
                 // has no location of its own.
                 let known = if a.pos.src != Source::Invalid { Some(a.pos.v) } else { a.last_place };
                 let r = if have_pos { Some(a.pos.v) } else { rx_ref.or(known) };
-                r.and_then(|(rl, ro)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro))
+                // A place read against a rough one is believed only near it:
+                // what one receiver there could hear. A rough place that is
+                // not the aircraft's (one stray fix, another aircraft under
+                // the same address) gives one a quarter of the globe off,
+                // and the next is tried: the receiver's, then where the
+                // aircraft last stood.
+                let near = |(rl, ro): (f64, f64)| cpr::global_surface(e.lat, e.lon, d.lat, d.lon, c.odd, rl, ro).filter(|&(l, o)| dist_m(rl, ro, l, o) <= SITE_REACH_M);
+                r.into_iter().chain(rx_ref).chain(known).chain(a.last_place).find_map(near)
             } else {
                 global = true;
                 cpr::global_airborne(e.lat, e.lon, d.lat, d.lon, c.odd)
@@ -1127,7 +1265,36 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
         global = false;
         fix = cpr::local(c.lat, c.lon, c.odd, c.surface, a.pos.v.0, a.pos.v.1);
     }
-    let Some((lat, lon)) = fix else { return Pos::None };
+    let Some((mut lat, mut lon)) = fix else { return Pos::None };
+
+    // Two aircraft under one address, both heard by this receiver: the
+    // pair is then one half from each, and decodes to a place neither is
+    // at (seen on the probe: Rome and Texas gave the South Atlantic).
+    // The message alone, read against an established track, says
+    // whether it is the track's own.
+    let own_adsb = !a.restarted && a.pos.src >= Source::Tisb && a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 120_000;
+    if global && own_adsb && a.established() {
+        let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
+        let reach = reach_m(a, c.surface, now, dt);
+        if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > reach {
+            if let Some((l, o)) = cpr::local(c.lat, c.lon, c.odd, c.surface, a.pos.v.0, a.pos.v.1).filter(|&(l, o)| dist_m(a.pos.v.0, a.pos.v.1, l, o) <= reach) {
+                (lat, lon, global) = (l, o, false);
+            }
+        }
+    }
+    // A track dropped for messages from elsewhere: those messages may
+    // be two aircraft's, so the first fix waits for a second, from
+    // another message, that agrees with it.
+    if a.restarted && global {
+        let agreed = a.far.map_or(false, |(flat, flon, ft, fkey)| {
+            let since = now.saturating_sub(ft);
+            (fkey ^ key) & ((1 << 36) - 1) != 0 && since <= FAR_HOLD && dist_m(flat, flon, lat, lon) <= reach_m(a, false, now, since as f64 / 1000.0)
+        });
+        if !agreed {
+            a.far = Some((lat, lon, now, key));
+            return Pos::None;
+        }
+    }
 
     // A place solved elsewhere gives way to the aircraft's own word (as
     // below), but not to one message that puts it where it cannot have
@@ -1135,12 +1302,12 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     // position moved an airliner 300 km, and was then the reference its
     // next messages were read against. A second message that agrees
     // settles it: then the solved place was the wrong one.
-    if a.pos.src != Source::Invalid && a.pos.src < Source::Tisb && now.saturating_sub(a.pos.t) < 120_000 {
+    if !a.restarted && a.pos.src != Source::Invalid && a.pos.src < Source::Tisb && now.saturating_sub(a.pos.t) < 120_000 {
         let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
         if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > reach_m(a, c.surface, now, dt) + SOLVED_SLACK_M {
             let agreed = a.far.map_or(false, |(flat, flon, ft, fkey)| {
                 let since = now.saturating_sub(ft);
-                fkey != key && since <= FAR_HOLD && dist_m(flat, flon, lat, lon) <= reach_m(a, c.surface, now, since as f64 / 1000.0)
+                (fkey ^ key) & ((1 << 36) - 1) != 0 && since <= FAR_HOLD && dist_m(flat, flon, lat, lon) <= reach_m(a, c.surface, now, since as f64 / 1000.0)
             });
             if !agreed {
                 a.far = Some((lat, lon, now, key));
@@ -1155,7 +1322,7 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     // MLAT result two kilometres off, an aircraft that began sending
     // ADS-B was refused, lost its place, and was given the MLAT one
     // back, every few seconds; readsb takes the first ADS-B position.)
-    if a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < 120_000 && a.pos.src >= Source::Tisb {
+    if own_adsb {
         let dt = now.saturating_sub(a.pos.t) as f64 / 1000.0;
         if dist_m(a.pos.v.0, a.pos.v.1, lat, lon) > reach_m(a, c.surface, now, dt) {
             if a.by_trusted && !a.pos_trusted && global {
@@ -1195,22 +1362,12 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
                 }
             }
             if (strong || global) && !waiting {
-                a.suspect = Some(Suspect { rx, wit: [rx, 0, 0, 0], n: 1, key: frame_key, t: now as u32, lat, lon, cpr: *c, src, strong });
+                a.suspect = Some(Suspect { rx, wit: [rx, 0, 0, 0], n: 1, key: frame_key, t: now as u32, lat, lon, cpr: *c, src, strong, global });
             }
-            if strong {
-                return Pos::None;
-            }
-            a.pos_bad += 1;
-            if a.pos_bad > 4 {
-                // the old position was the wrong one: start over. It is
-                // still a better rough place for surface messages than
-                // where the aircraft last went quiet, which may be the
-                // far end of the flight it has just made.
-                a.pos_bad = 0;
-                a.last_place = Some(a.pos.v);
-                a.pos.src = Source::Invalid;
-                a.pos_confirmed = 0;
-                a.cpr = [RxCpr::default(); CPR_ROWS];
+            // against a confirmed position it counts once a second
+            // receiver has heard it too (`corroborate_suspect`)
+            if !strong {
+                a.refused(now);
             }
             return Pos::None;
         }
@@ -1218,7 +1375,14 @@ fn position(a: &mut Aircraft, c: &Cpr, src: Source, now: Ms, rx: u64, rx_ref: Op
     if src < a.pos.src && now.saturating_sub(a.pos.t) < STALE {
         return Pos::None;
     }
+    let fresh = a.restarted || a.pos.src == Source::Invalid || a.pos.src < Source::Tisb;
     adopt(a, lat, lon, c, src, now, rx);
+    if fresh {
+        a.pos_globals = 0;
+    }
+    if global {
+        a.pos_globals = a.pos_globals.saturating_add(1);
+    }
     // only a message that was believed can be confirmed by its repeats
     a.recent_cpr[a.recent_i as usize % 6] = key;
     a.recent_i = a.recent_i.wrapping_add(1);
@@ -1405,8 +1569,21 @@ pub fn apply_external(a: &mut Aircraft, e: &External, now: Ms, wall: Ms) -> Pos 
         }
         return Pos::None;
     }
+    let before = (a.pos.src != Source::Invalid && now.saturating_sub(a.pos.t) < FIELD_TTL).then_some(a.pos.v);
     if !a.pos.accept_after((lat, lon), src, now, STALE) {
         return Pos::None;
+    }
+    track_from(a, before, lat, lon, src, now);
+    if src == Source::Sbs {
+        // A place from a BaseStation feed says nothing of how good the
+        // aircraft's own fix is, and readsb drops what the aircraft said
+        // of it with each one: an aircraft heard directly as well shows
+        // nac_p, nac_v, sil, gva and sda only from each status message
+        // to the next feed position (tools/sbs_src_probe.py).
+        for f in [&mut a.nac_p, &mut a.nac_v, &mut a.sil, &mut a.gva, &mut a.sda] {
+            f.src = Source::Invalid;
+        }
+        a.sil_type = 3;
     }
     a.nic = 0;
     a.rc = 0;
@@ -1641,6 +1818,7 @@ impl Store {
                 if a.trace.is_empty() {
                     continue;
                 }
+                crate::trace::settle(&mut a, now);
                 a.trace.compact(0);
                 s.gone.insert(addr, Gone { seen: a.seen, pos: a.pos, nic: a.nic, rc: a.rc, last_place: a.last_place, heat_tag: a.heat_tag, trace: std::mem::take(&mut a.trace) });
             }
@@ -1649,6 +1827,7 @@ impl Store {
             let cut = now.saturating_sub(keep_trace);
             for a in s.map.values_mut() {
                 a.fade_position(now);
+                crate::trace::settle(a, now);
                 a.trace.trim_before(cut);
             }
             for g in s.gone.values_mut() {
@@ -1900,6 +2079,39 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_fix_does_not_carry_a_parked_aircraft_away() {
+        // Seen beside readsb, on one trusted link carrying many receivers:
+        // an aircraft parked overnight at a European airport was placed,
+        // a minute and a half before it started to move, by one airborne
+        // pair from 7,000 km away (low and slow over the American Midwest,
+        // no doubt another aircraft under the same address). Its surface
+        // messages were then read against that fix and showed it a quarter
+        // of the globe west, on the ground, for seven minutes, until it
+        // took off. readsb kept it at the airport throughout.
+        let (airport, stray) = ((45.731, 4.938), (39.067, -94.897));
+        let say = |a: &mut Aircraft, f: &[u8], now: Ms, rx: u64, key: u64| {
+            let m = modes::decode(f, |_| true).unwrap();
+            a.by_trusted = true;
+            apply(a, &m, 100, now, rx, None, key)
+        };
+        let mut a = Aircraft::new(1, T0);
+        // where it stood when it went quiet, hours before
+        a.last_place = Some(airport);
+        say(&mut a, &enc::airborne_position(1, stray.0, stray.1, 425, false, 11), T0, 2, 1);
+        say(&mut a, &enc::airborne_position(1, stray.0, stray.1, 425, true, 11), T0 + 500, 2, 2);
+        assert!(a.pos_valid(T0 + 500) && dist_m(a.pos.v.0, a.pos.v.1, stray.0, stray.1) < 1_000.0, "the stray fix is taken: {:?}", a.pos.v);
+        let mut t = T0 + 95_000;
+        for i in 0..420u64 {
+            say(&mut a, &enc::surface_position(1, airport.0, airport.1, 0.0, 0.0, i % 2 == 1), t, 3, 10 + i);
+            let at_airport = dist_m(a.pos.v.0, a.pos.v.1, airport.0, airport.1) < 500_000.0;
+            let at_stray = dist_m(a.pos.v.0, a.pos.v.1, stray.0, stray.1) < 1_000.0;
+            assert!(!a.pos_valid(t) || at_airport || at_stray, "message {i}: placed at {:?}", a.pos.v);
+            t += 1000;
+        }
+        assert!(a.pos_valid(t - 1000) && dist_m(a.pos.v.0, a.pos.v.1, airport.0, airport.1) < 1_000.0, "at the end: {:?}", a.pos.v);
+    }
+
+    #[test]
     fn a_parked_aircraft_is_placed_by_where_it_last_was() {
         // no receiver location at all: only the aircraft's own history
         let mut a = Aircraft::new(1, T0);
@@ -1953,6 +2165,109 @@ mod tests {
     }
 
     #[test]
+    fn an_aircraft_only_mlat_places_has_a_direction() {
+        // tools/mlat_track_probe.py beside readsb: north at first, then
+        // the direction of each step of 100 m or more, and of no smaller
+        let at = |p: (f64, f64)| External { source: Source::Mlat, pos: Some(p), addr_type: Some(modes::AddrType::Mlat), ..Default::default() };
+        // as the JSON has it: none beside a reported track
+        let shown = |a: &Aircraft, t: Ms| a.track.get(t).is_none().then(|| if a.calc_track.t != 0 { a.calc_track.v.round() } else { 0.0 });
+        let mut a = Aircraft::new(1, T0);
+        apply_external(&mut a, &at((45.0, 9.0)), T0, T0);
+        assert_eq!(shown(&a, T0), Some(0.0));
+        // 231 m east in a second: 450 kt
+        apply_external(&mut a, &at((45.0, 9.00294)), T0 + 1000, T0 + 1000);
+        assert_eq!(shown(&a, T0 + 1000), Some(90.0));
+        // 31 m north, a helicopter at 60 kt: no word on direction
+        apply_external(&mut a, &at((45.00028, 9.00294)), T0 + 2000, T0 + 2000);
+        assert_eq!(shown(&a, T0 + 2000), Some(90.0));
+        // due north is 360, 0 being an aircraft that has none yet
+        apply_external(&mut a, &at((45.003, 9.00294)), T0 + 3000, T0 + 3000);
+        assert_eq!(shown(&a, T0 + 3000), Some(360.0));
+        // a track the solver gives is shown instead
+        apply_external(&mut a, &External { track: Some(123.0), gs: Some(400.0), ..at((45.006, 9.00294)) }, T0 + 4000, T0 + 4000);
+        assert_eq!(shown(&a, T0 + 4000), None);
+    }
+
+    #[test]
+    fn an_aircraft_first_heard_on_the_ground_is_placed_by_the_site() {
+        // no receiver location, no history: the aggregator's own place
+        // serves, for an airport a receiver there could hear
+        let say = |a: &mut Aircraft, p: (f64, f64), site: (f64, f64)| {
+            for i in 0..2u64 {
+                let m = modes::decode(&enc::surface_position(a.addr, p.0, p.1, 10.0, 90.0, i == 1), |_| true).unwrap();
+                apply(a, &m, 100, T0 + 500 * i, 1, Some(site), i);
+            }
+        };
+        let mut a = Aircraft::new(1, T0);
+        say(&mut a, (45.63, 8.72), (45.5, 9.2));
+        assert!(a.pos_valid(T0 + 500) && (a.pos.v.0 - 45.63).abs() < 1e-3 && (a.pos.v.1 - 8.72).abs() < 1e-3);
+        // one a quarter of the globe from the site decodes to somewhere
+        // near it, and is not believed
+        let mut b = Aircraft::new(2, T0);
+        say(&mut b, (40.64, -73.78), (45.5, 9.2));
+        assert!(!b.pos_valid(T0 + 500), "placed at {:?}", b.pos.v);
+    }
+
+    #[test]
+    fn two_aircraft_under_one_address() {
+        // Rome and Texas, each sending twice a second, through one
+        // receiver that hears both and through two receivers each.
+        let (rome, texas) = ((41.9, 12.5), (35.0, -100.0));
+        // standing still (the same words again and again) and under way
+        for (nrx, step) in [(1u64, 0.0), (2, 0.0), (1, 0.0015), (2, 0.0015)] {
+            let mut a = Aircraft::new(1, T0);
+            let mut key = 0;
+            let mut n = 0.0;
+            let mut say = |a: &mut Aircraft, p: (f64, f64), odd: bool, t: Ms, first_rx: u64| {
+                key += 1;
+                n += step;
+                let m = modes::decode(&enc::airborne_position(1, p.0 + n, p.1, 36000, odd, 11), |_| true).unwrap();
+                // now one receiver is first with it, now the other
+                let lead = first_rx + key % nrx;
+                let r = apply(a, &m, 100, t, lead, None, key);
+                if r.pos != Pos::None {
+                    a.remember(key, t, true);
+                }
+                for rx in (first_rx..first_rx + nrx).filter(|&rx| rx != lead) {
+                    match a.duplicate(key, 100, t + 20, rx, true) {
+                        Some(_) => a.confirm_position(rx, t + 20),
+                        None => {
+                            a.corroborate_suspect(key, rx, t + 20);
+                        }
+                    }
+                }
+            };
+            let at = |a: &Aircraft, p: (f64, f64), t: Ms| a.pos_valid(t) && dist_m(a.pos.v.0, a.pos.v.1, p.0, p.1) < 60_000.0;
+            let mut t = T0;
+            for i in 0..40 {
+                say(&mut a, rome, i % 2 == 1, t, 1);
+                t += 500;
+            }
+            assert!(at(&a, rome, t));
+            // both for forty seconds: the first is kept throughout
+            for i in 0..80 {
+                say(&mut a, texas, i % 2 == 1, t + 250, if nrx == 1 { 1 } else { 5 });
+                say(&mut a, rome, i % 2 == 0, t + 500, 1);
+                t += 500;
+                assert!(at(&a, rome, t), "{nrx} receivers, step {step}, message {i}: at {:?}", a.pos.v);
+            }
+            // the first stops: the second takes over, not at once
+            let stopped = t;
+            let mut moved = None;
+            for i in 0..120 {
+                say(&mut a, texas, i % 2 == 1, t + 250, if nrx == 1 { 1 } else { 5 });
+                t += 500;
+                assert!(at(&a, rome, t) || at(&a, texas, t) || !a.pos_valid(t), "{nrx} receivers, step {step}: at {:?}", a.pos.v);
+                if moved.is_none() && at(&a, texas, t) {
+                    moved = Some(t - stopped);
+                }
+            }
+            let moved = moved.expect("the second is believed in the end");
+            assert!((8_000..=30_000).contains(&moved), "{nrx} receivers, step {step}: moved after {moved} ms");
+        }
+    }
+
+    #[test]
     fn one_receiver_cannot_move_a_confirmed_aircraft() {
         let mut a = Aircraft::new(1, T0);
         let feed_rx = |a: &mut Aircraft, f: &[u8], now: Ms, rx: u64, key: u64| {
@@ -1977,18 +2292,19 @@ mod tests {
         }
         assert!((a.pos.v.0 - 45.5).abs() < 1e-3);
 
-        // but when a second receiver hears those same messages, the
-        // aircraft itself is sending them: nobody is blamed, and after a
-        // few it is believed
+        // but when a second receiver hears those same messages, an
+        // aircraft is sending them: nobody is blamed, and once the first
+        // place has had no word for a while, it is believed
         let mut b = Aircraft::new(2, T0);
         feed_rx(&mut b, &enc::airborne_position(2, 45.5, 9.25, 35000, false, 11), T0, 1, 10);
         feed_rx(&mut b, &enc::airborne_position(2, 45.5, 9.25, 35000, true, 11), T0 + 400, 1, 11);
         b.confirm_position(2, T0 + 450);
         let mut t = T0 + 1000;
-        for i in 0..8u64 {
+        for i in 0..40u64 {
             feed_rx(&mut b, &enc::airborne_position(2, 48.0 + i as f64 * 1e-4, 9.25, 35000, i % 2 == 1, 11), t, 3, 200 + i);
             b.corroborate_suspect(200 + i, 4, t);
             assert_eq!(b.take_blame(t + 3000).1, 0);
+            assert!(i >= 12 || (b.pos.v.0 - 45.5).abs() < 1e-3, "not within seven seconds");
             t += 500;
         }
         assert!((b.pos.v.0 - 48.0).abs() < 0.01, "{}", b.pos.v.0);

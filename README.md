@@ -44,7 +44,7 @@ and ignored. `Dockerfile` and `deploy/aggd.service` are there to start from.
 | | |
 |---|---|
 | In | Beast (receiver UUID; forwarded receiver ids from trusted links); BaseStation: plain, MLAT results, JAERO ADS-C, priority; UAT (dump978 raw lines) |
-| Out, streams | Beast full, Beast reduced, Beast reduced with receiver ids (MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
+| Out, streams | Beast full, Beast reduced, either with receiver ids (`--net-receiver-id`; MLAT results included with `--forward-mlat`), BaseStation (optionally rate-limited, optionally with MLAT), BaseStation JAERO only, JSON position lines; each as a listener or an outbound connector |
 | Out, HTTP | `aircraft.json`, `receiver.json`, `clients.json`, `receivers.json`, `stats.json`, `status.json`, `aircraft.binCraft[.zst]`, `globe_N.binCraft[.zst]`, `globeMil_N…`, `traces/xx/trace_{full,recent}_HEX.json`, `/globe_history/…`, `/metrics` (Prometheus), and the re-api queries: `all`, `circle`, `closest`, `box`, `find_hex`, `find_callsign`, `find_reg`, `find_type` (combinable, as tar1090 does), the `filter_*` set, `jv2`, `binCraft`, `zstd` |
 | Web | `--web-root DIR` serves a directory beside the data. With tar1090's html directory aggd is the whole map server: no nginx, nothing written to a tmpfs |
 | Kept | per-day trace files in tar1090's `globe_history` layout; traces across restarts; heat map files (`--heatmap N`); with `--write-traces`, each aircraft's live trace files beside the `--write-json` files, as readsb keeps them |
@@ -71,8 +71,12 @@ and a few are hostile:
   message. If none does, the receiver is at fault; a receiver at fault on
   five different aircraft in a minute has its positions ignored for ten.
   If others do, the many are believed over the few: the track moves only
-  when more receivers relay the new position than half of those standing
-  behind the old one. That is how an aircraft whose GPS is interfered
+  when more receivers relay the new position than stand behind the old
+  one. Equal numbers are two aircraft under one address, or a recording
+  played back: the first is kept for as long as it goes on being heard,
+  as readsb keeps it, and the second is shown once the first has been
+  silent for seven seconds and seventeen of the second's messages have
+  come. That is how an aircraft whose GPS is interfered
   with is followed (every receiver hears its jump), and how receivers
   that lie identically lose to an honest majority, and are blamed. The
   contradictions must also be a tenth or more of what the receiver sent
@@ -129,10 +133,13 @@ floods below the rate limits from many addresses.
   tracking record, and is restored if it returns. Trace points are 24
   bytes; an aircraft in flight keeps its newest few dozen open and packs
   the rest away in chunks of about a hundred (differences between
-  successive points, by column, then zstd: about 13 bytes a point on
+  successive points, by column, then zstd: about 12 bytes a point on
   real traces). A chunk is written once and dropped whole when it ages
   out, so the heap is not churned: recompressing a growing trace in
-  place left 14 MB of holes within an hour.
+  place left 14 MB of holes within an hour. The same chunks, as they
+  are, make up the state file: saving copies them and restoring reads
+  them, and since none is ever rewritten, stopping only has to save the
+  ones added since the hourly save.
 - The airframe database (645,000 airframes, 34 MB of text) is held
   compressed in 32 KB blocks, 20 MB less; a block is opened for the one
   lookup each aircraft gets.
@@ -249,9 +256,9 @@ build:
 | with the day of traces | 160 MB | 166 MB | 55 MB |
 
 Traces fetched from the old and new builds are byte for byte the same.
-(The saved file leaves out the detail kept once a minute or so beside
-the points, so a day lived through is somewhat larger than a day
-loaded.) On the synthetic load the process went from 62 MB to 39 MB.
+(The saved file of that time left out the detail kept once a minute or
+so beside the points, so a day lived through was somewhat larger than a
+day loaded; it is saved too now.) On the synthetic load the process went from 62 MB to 39 MB.
 
 Started beside readsb with that day of history already loaded, so in
 the state the earlier runs took 24 hours to reach, and at the afternoon
@@ -268,10 +275,64 @@ files, while aggd always keeps a day of traces and writes the history.
 A second readsb started on the same stream with what a tar1090
 aggregator runs (`--write-json-globe-index --write-globe-history
 --heatmap 30`) held 82 MB a minute after starting, with no history yet,
-and 124 MB after three hours, still rising by about 10 MB an hour, and
-used 37,800 CPU ticks an hour (a tenth of a core) where aggd used 1,040
-and the bare readsb 1,900. Those are three night-time hours with about
-300 aircraft in the air; a day of it has not been measured.
+124 MB after three hours, 256 MB after fifteen and 347 MB after 38,
+when it was stopped, and used 42,500 CPU ticks an hour (an eighth of a
+core). Over the 48 hours of the same run aggd stayed at 91 to 92 MB and
+used 1,620 ticks an hour, and the bare readsb 57 MB and 2,720.
+
+#### A large network
+
+An operator with 740 receivers (50,000 messages a second, 12,000 to
+17,400 aircraft at once, 75,561 with a trace over the day) saw memory
+grow by about 50 MB an hour, to 1,416 MB at the evening peak, of which
+the table was 1,000 to 1,020 MB. That is the day filling, at his 76
+million or so points a day, and it stops there: a trace is cut at
+`--trace-hours` (whole chunks, so a trace may run up to one chunk, 127
+points at most, past it), and an aircraft not heard for that long is
+dropped. What the table holds in the steady state:
+
+    11.5 MB for each million points of the last 24 hours
+     + 4 KB for each aircraft in the air (2 KB of tracking record, and
+            its newest points, up to 127, at 24 bytes)
+     + 0.3 KB for each aircraft kept for its trace
+     + 36 bytes for each detail (what else the aircraft said of itself,
+            kept beside a point when it changed, and every ten minutes)
+
+which for him is 875 + 70 + 23 MB and the details, or 13 MB for every
+thousand aircraft of the day at his thousand points each. (Details came
+to one for every ten points in 25 minutes of real traffic, which would be
+a fifth more; his table says less than a tenth over a day.) (The 11.5 is 10.7 bytes a point
+packed, and the rest what each chunk and each buffer costs besides; it
+was 12.0 before chunks were compressed harder, zstd level 13 for 3: a
+table of 76 million points went from 916 to 877 MB, read back the same.
+What else was tried on a day of real traces: chunks four times the size,
+7 % less but a trace then outlives its hours by as much; a trained
+dictionary, 6 %; level 19, 1 % more than 13 for five times the time.)
+`aggd_trace_points` and `aggd_table_bytes` in `/metrics` are the two
+sides of it.
+
+That it is flat after the first day is tested three ways. A week of
+steady traffic in simulated time (a test, `a_week_of_steady_traffic_
+holds_one_day_of_it`): the points, bytes and aircraft held on days three
+to seven are within 2 % of the second day's (5 % for the aircraft). A
+25-minute tape of real traffic (900 aircraft at once) played three times
+over with `--trace-hours 0.1`, so that the six minutes kept pass twelve
+times: from the first quarter hour to the last the table held 14,000 to
+14,700 points in 2.7 to 2.9 MB (4.0 for the minutes when the end of the
+tape and its beginning overlap), and the process 10.0 to 10.5 MB from
+the 25th minute on. And the same with 18 minutes kept, so that aircraft
+are forgotten and return, for 75 minutes: 43,500 to 45,900 points in 4.6
+to 5.3 MB from the 25th minute on, the process 12.1 to 12.8 MB.
+
+The memory of the process beyond the table (his 400 MB) is not accounted
+for here: `aggd_heap_used_bytes` less `aggd_table_bytes` is what else is
+in use (the rendered documents, the connections' buffers, the airframe
+database), `aggd_heap_free_bytes` what the allocator holds and has not
+given back.
+
+Stopping and starting at that size are in `docs/MIGRATING.md`, step 6;
+`at_scale` in `persist.rs` builds such a table from any real state file
+and times them.
 
 Real traffic is where the rules that no standard states show up, and
 most of the work was finding them, one experiment at a time, with
@@ -366,9 +427,27 @@ On the recorded traffic, in rough order of how often:
 - Altitude, accuracy (NACp, SIL, Rc) and version differ for well under
   a percent of aircraft at any moment. One case is not understood: an
   aircraft whose version readsb set back to 0 as it was first placed.
-- `calc_track` and the DF18 non-transponder position noted in the probe.
-- BaseStation output carries each transmission once, not once per receiver
-  that heard it.
+- The DF18 non-transponder position noted in the probe.
+- Two places under one address (`tools/jump_probe.py`, 40 short
+  histories through one receiver and through two): while the first
+  aircraft is heard neither moves to the second, through ten seconds of
+  the second alone. When the first stops, readsb shows the second 8 to
+  45 s later and aggd 10 to 26 s; at 60 km and at 9,000 km apart readsb
+  takes about 40 s whatever the message rate, by a rule not found.
+- The `box` and `circle` queries, asked of both on live traffic twelve
+  times: the same aircraft, but for one whose position was 59.9 s old
+  in readsb's answer and gone from aggd's, and one aggd had first
+  placed 0.3 s before. An aircraft or two more or fewer at any moment
+  is the two not answering at the same instant.
+- An aircraft placed by a BaseStation feed and heard directly as well
+  (`tools/sbs_src_probe.py`): version, accuracy figures and kind change
+  at the same moments in both; a new aircraft is shown a second or two
+  sooner by aggd.
+- BaseStation output, plain and with `--net-sbs-reduce`, was compared
+  with readsb's under load (1,400 aircraft, 40 receivers): the same
+  lines by type to within 3 %. The reduced stream leaves out altitude
+  replies of aircraft with a current ADS-B altitude, as readsb's did;
+  whether readsb does so for every aircraft was not measured.
 - MLAT and ADS-C beside direct reception (`tools/src_probe.py`): an
   aircraft's own position always wins, MLAT replaces it after 15 s of
   silence, and an ADS-C report places only an aircraft that has had no
@@ -403,6 +482,53 @@ On the recorded traffic, in rough order of how often:
   aircraft on the ground, which readsb does not. It was checked with
   frames built from the standard's layout (`tools/uat_probe.py`), sent to
   both; no recorded UAT traffic was available.
+- Traces: which positions become points is readsb's rule as far as it
+  could be measured (the list is at `trace::due`), and on scripted
+  flights the two keep the same points at the same moments
+  (`tools/trace_probe.sh`). At first aggd kept a point every interval
+  and at 2 degrees or 200 ft of change, and an operator's shadow run
+  found its day files with a median 66 % of readsb's points: readsb
+  keeps far more of a climb or descent low down (every 75 ft below
+  7,000 ft), of the ground, of an aircraft's first minute and of the
+  minute after take-off and landing, and a point for every change of
+  vertical rate over 200 ft/min. Beside readsb on the same live traffic
+  for 35 minutes (840 aircraft, interval 30 s), counting what each
+  holds for good: 96.8 % of readsb's points (per aircraft a median of
+  96 %, 88 % at the tenth percentile, 110 % at the ninetieth), 314
+  points an aircraft-hour to its 322; the old rule had 75.0 % (75 %,
+  43 %, 102 %) and 246. `trace_recent` the same: 96.9 % against 78.0 %.
+  It costs what the points cost: with the same traffic from the same
+  start, after half an hour, 61,384 points to the old rule's 41,238,
+  4.5 MB of table to 3.4 MB, 12.0 MB resident to 10.3 MB, and a tenth
+  more processor time (0.34 % of a core to 0.31 %).
+  What is left: readsb's `trace_full` of an aircraft it has stopped
+  hearing, written some ten to sixteen minutes later, ends with every
+  position of its last 47 s (about 95 points), which are gone from the
+  file again if the aircraft returns; aggd keeps the last position
+  heard and no more (keeping them would take 2.3 KB for every aircraft
+  in the air and a kilobyte of trace for every time one is lost).
+  Counting those files too, aggd has 81.8 % of all the points readsb
+  published in the 35 minutes (median 94 %, tenth percentile 30 %: the
+  aircraft heard briefly), the old rule 63.4 % (68 %, 19 %). readsb keeps a point 350 ft from the last above
+  12,000 ft about one time in four, where aggd waits for 375; an
+  aircraft that sends no track gets points from the track readsb works
+  out of its positions. `trace_recent` holds 92 points in readsb and
+  142 here. readsb wrote no day file in two and a half hours of running
+  nor when stopped, so its day files were not compared: what is
+  compared is what it publishes in `trace_recent` and `trace_full`.
+  One point in four carries what else was known of the aircraft
+  (callsign, squawk, selected altitude and the rest), as in readsb's
+  files; they were kept once a minute at first, and stamped so that
+  hardly any was ever shown.
+- Day files (`--write-globe-history`) keep what is in them. A day file
+  is written from the table, and at first was simply replaced: after
+  a start without `--write-state` the day's earlier points were lost
+  from the file of every aircraft heard again (346 of 420 files in a
+  five-minute trial), after a crash those since the hourly state file
+  (214 of 493), and with `--trace-hours` under 24 whatever had aged
+  out. Now the file is read first in those cases and its points stay
+  (0 files lost points in the same trials). A day begun by readsb in a
+  shared directory is carried on the same way.
 - Trace files on disk (`--write-traces`): readsb's `trace_recent` is
   rewritten about every 4 s while the aircraft adds points, as aggd's
   is; it holds 92 points where aggd's holds the 142 the HTTP server
@@ -430,6 +556,20 @@ coefficients in `wmm_data.rs` (NOAA, public domain).
 
 ## Tools
 
+- `tools/trace_probe.sh`: scripted flights (`aggbench flight`: a climb,
+  a turn, a silence, a landing, each at one steady rate) played to
+  readsb and aggd, and the trace points each kept, flight by flight.
+  `tools/trace_watch.py` collects the points readsb publishes as it
+  goes (it rewrites `trace_full` rarely and not when stopped);
+  `tools/trace_compare.py` compares two aggregators' traces of live
+  traffic: points per aircraft, per aircraft-hour, and what the points
+  only one of them has were doing.
+
+- `tools/jump_probe.py`, `tools/mlat_track_probe.py`,
+  `tools/sbs_src_probe.py`, `tools/rid_probe.py`: two aircraft under one
+  address; the direction shown for an aircraft only MLAT places; one a
+  BaseStation feed places that is heard directly too; receiver ids on
+  the Beast outputs. Each plays the same thing to readsb and aggd.
 - `tools/out_probe.py`: consumers on the Beast outputs of an aggregator
   under load, one of them slow: connections each needed, frames, bytes
   that were not a frame.
@@ -440,7 +580,9 @@ coefficients in `wmm_data.rs` (NOAA, public domain).
   outputs compared frame by frame.
 
 - `tools/check.sh [quick]`: unit tests, malformed input, hostile
-  receivers, readsb side by side; start here.
+  receivers, readsb side by side; start here. (These scripts stop the
+  aggd and aggbench they started and no other, so they can be run where
+  an aggregator is working; they do use ports 37004 to 39152.)
 - `aggbench record SOURCE FILE`, `tools/replay.sh TAPE`, `aggbench dump
   TAPE HEX`: tape a real Beast stream, replay it to readsb and aggd,
   read one aircraft out of it. `tools/shadow.sh HOST PORT` does the same
